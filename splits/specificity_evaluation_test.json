@@ -165,6 +165,35 @@
         ]
     ],
     [
+        "2er8",
+        [
+            [
+                [
+                    "JASPAR",
+                    "MA0324.1.jaspar"
+                ]
+            ],
+            [
+                [
+                    "JASPAR",
+                    "MA0324.1.jaspar"
+                ]
+            ],
+            [
+                [
+                    "JASPAR",
+                    "MA0324.1.jaspar"
+                ]
+            ],
+            [
+                [
+                    "JASPAR",
+                    "MA0324.1.jaspar"
+                ]
+            ]
+        ]
+    ],
+    [
         "2ere",
         [
             [
@@ -537,6 +566,51 @@
         ]
     ],
     [
+        "5cc1",
+        [
+            [
+                [
+                    "HOCOMOCO",
+                    "GCR_HUMAN.H11MO.0.A"
+                ],
+                [
+                    "JASPAR",
+                    "MA0113.3.jaspar"
+                ]
+            ],
+            [
+                [
+                    "HOCOMOCO",
+                    "GCR_HUMAN.H11MO.0.A"
+                ],
+                [
+                    "JASPAR",
+                    "MA0113.3.jaspar"
+                ]
+            ],
+            [
+                [
+                    "HOCOMOCO",
+                    "GCR_HUMAN.H11MO.0.A"
+                ],
+                [
+                    "JASPAR",
+                    "MA0113.3.jaspar"
+                ]
+            ],
+            [
+                [
+                    "HOCOMOCO",
+                    "GCR_HUMAN.H11MO.0.A"
+                ],
+                [
+                    "JASPAR",
+                    "MA0113.3.jaspar"
+                ]
+            ]
+        ]
+    ],
+    [
         "5e69",
         [
             [
@@ -662,6 +736,96 @@
         ]
     ],
     [
+        "5edn",
+        [
+            [
+                [
+                    "JASPAR",
+                    "MA0901.2.jaspar"
+                ],
+                [
+                    "HOCOMOCO",
+                    "HXB13_HUMAN.H11MO.0.A"
+                ]
+            ],
+            [
+                [
+                    "JASPAR",
+                    "MA0901.2.jaspar"
+                ],
+                [
+                    "HOCOMOCO",
+                    "HXB13_HUMAN.H11MO.0.A"
+                ]
+            ],
+            [
+                [
+                    "JASPAR",
+                    "MA0901.2.jaspar"
+                ],
+                [
+                    "HOCOMOCO",
+                    "HXB13_HUMAN.H11MO.0.A"
+                ]
+            ],
+            [
+                [
+                    "JASPAR",
+                    "MA0901.2.jaspar"
+                ],
+                [
+                    "HOCOMOCO",
+                    "HXB13_HUMAN.H11MO.0.A"
+                ]
+            ]
+        ]
+    ],
+    [
+        "5flv",
+        [
+            [
+                [
+                    "JASPAR",
+                    "MA0063.1.jaspar"
+                ],
+                [
+                    "HOCOMOCO",
+                    "NKX25_MOUSE.H11MO.0.A"
+                ]
+            ],
+            [
+                [
+                    "JASPAR",
+                    "MA0063.1.jaspar"
+                ],
+                [
+                    "HOCOMOCO",
+                    "NKX25_MOUSE.H11MO.0.A"
+                ]
+            ],
+            [
+                [
+                    "JASPAR",
+                    "MA0063.1.jaspar"
+                ],
+                [
+                    "HOCOMOCO",
+                    "NKX25_MOUSE.H11MO.0.A"
+                ]
+            ],
+            [
+                [
+                    "JASPAR",
+                    "MA0063.1.jaspar"
+                ],
+                [
+                    "HOCOMOCO",
+                    "NKX25_MOUSE.H11MO.0.A"
+                ]
+            ]
+        ]
+    ],
+    [
         "5k5i",
         [
             [
@@ -782,6 +946,23 @@
         ]
     ],
     [
+        "6cnp",
+        [
+            [
+                [
+                    "HOCOMOCO",
+                    "MBD2_HUMAN.H11MO.0.B"
+                ]
+            ],
+            [
+                [
+                    "HOCOMOCO",
+                    "MBD2_HUMAN.H11MO.0.B"
+                ]
+            ]
+        ]
+    ],
+    [
         "6df5",
         [
             [
@@ -887,6 +1068,31 @@
         ]
     ],
     [
+        "6u82",
+        [
+            [
+                [
+                    "JASPAR",
+                    "MA0468.1.jaspar"
+                ],
+                [
+                    "HOCOMOCO",
+                    "DUX4_HUMAN.H11MO.0.A"
+                ]
+            ],
+            [
+                [
+                    "JASPAR",
+                    "MA0468.1.jaspar"
+                ],
+                [
+                    "HOCOMOCO",
+                    "DUX4_HUMAN.H11MO.0.A"
+                ]
+            ]
+        ]
+    ],
+    [
         "6v8u",
         [
             [
@@ -934,6 +1140,41 @@
     [
         "7n5u",
         [
+            [
+                [
+                    "HOCOMOCO",
+                    "ZBT7A_HUMAN.H11MO.0.A"
+                ],
+                [
+                    "JASPAR",
+                    "MA0750.2.jaspar"
+                ]
+            ]
+        ]
+    ],
+    [
+        "7n5v",
+        [
+            [
+                [
+                    "HOCOMOCO",
+                    "ZBT7A_HUMAN.H11MO.0.A"
+                ],
+                [
+                    "JASPAR",
+                    "MA0750.2.jaspar"
+                ]
+            ],
+            [
+                [
+                    "HOCOMOCO",
+                    "ZBT7A_HUMAN.H11MO.0.A"
+                ],
+                [
+                    "JASPAR",
+                    "MA0750.2.jaspar"
+                ]
+            ],
             [
                 [
                     "HOCOMOCO",
@@ -1023,6 +1264,17 @@
                 [
                     "CIS-BP",
                     "M01167_2.00"
+                ]
+            ]
+        ]
+    ],
+    [
+        "AT1G27730_AACACACT",
+        [
+            [
+                [
+                    "CIS-BP",
+                    "M01852_2.00"
                 ]
             ]
         ]
@@ -1832,6 +2084,39 @@
                 [
                     "CIS-BP",
                     "M01180_2.00"
+                ]
+            ]
+        ]
+    ],
+    [
+        "PK09091.1_AACTAACT",
+        [
+            [
+                [
+                    "CIS-BP",
+                    "M01200_2.00"
+                ]
+            ]
+        ]
+    ],
+    [
+        "PK09091.1_AACTAAGT",
+        [
+            [
+                [
+                    "CIS-BP",
+                    "M01200_2.00"
+                ]
+            ]
+        ]
+    ],
+    [
+        "PK09091.1_AACTACTA",
+        [
+            [
+                [
+                    "CIS-BP",
+                    "M01200_2.00"
                 ]
             ]
         ]

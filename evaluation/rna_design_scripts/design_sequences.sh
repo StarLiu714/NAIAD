@@ -7,12 +7,16 @@
 #SBATCH --error=logs/%A_%a.err
 #SBATCH --job-name=design_sequences
 
+source /home/akubaney/projects/na_mpnn/.venv/bin/activate
+
 CSV_FILE=$1
 OUTPUT_DIR=$2
 METHOD=$3
 NUM_SAMPLES=$4
 TEMPERATURE=${5:-}
 NA_MPNN_MODEL_PATH=${6:-}
+WITH_PROTEIN=${7:-1}
+STRUCTURE_FILTER=${8:-all}
 
 # 1) sanity check
 if [[ ! -f "$CSV_FILE" ]]; then
@@ -20,15 +24,64 @@ if [[ ! -f "$CSV_FILE" ]]; then
     exit 1
 fi
 
-# 2) read all structure_path values via Python csv.DictReader
+# 2) read structure_path values via Python with optional filtering
 mapfile -t STRUCTURE_PATHS < <(
-    python - "$CSV_FILE" <<'PYCODE'
-import sys, pandas as pd
+    python - "$CSV_FILE" "$METHOD" "$WITH_PROTEIN" "$STRUCTURE_FILTER" <<'PYCODE'
+import os
+import sys
 
-df = pd.read_csv(sys.argv[1])
+import pandas as pd
 
-for p in df['structure_path']:
-    print(p)
+sys.path.insert(0, "/home/akubaney/projects/na_mpnn/evaluation")
+
+from na_eval_utils import extract_sequences_from_structure, prepare_complex_sequence_data
+
+csv_file, method, with_protein_raw, structure_filter = sys.argv[1:5]
+with_protein = bool(int(with_protein_raw))
+
+def classify_row(row):
+    structure_path = os.path.abspath(row["structure_path"])
+    na_sequence_data, protein_sequences = extract_sequences_from_structure(
+        structure_path
+    )
+    complex_sequence_data = prepare_complex_sequence_data(
+        na_sequence_data = na_sequence_data,
+        protein_sequences = protein_sequences
+    )
+
+    return {
+        "has_protein": complex_sequence_data["has_protein"],
+        "has_dna": complex_sequence_data["has_dna"],
+        "is_single_rna_chain": complex_sequence_data["is_single_rna_chain"],
+        "is_monomer_rna": complex_sequence_data["is_monomer_rna"],
+        "is_protein_monomer_rna": (
+            complex_sequence_data["is_single_rna_chain"] and
+            complex_sequence_data["has_protein"]
+        ),
+    }
+
+def passes_structure_filter(metadata):
+    if structure_filter in ("", "all"):
+        return True
+    if structure_filter == "monomer_rna":
+        return metadata["is_monomer_rna"]
+    if structure_filter == "protein_monomer_rna":
+        return metadata["is_protein_monomer_rna"]
+    if structure_filter == "has_protein":
+        return metadata["has_protein"]
+
+    raise ValueError(
+        f"Unsupported structure filter: {structure_filter}"
+    )
+
+df = pd.read_csv(csv_file)
+
+for _, row in df.iterrows():
+    metadata = classify_row(row)
+    if not passes_structure_filter(metadata):
+        continue
+
+    print(row["structure_path"])
 PYCODE
 )
 
@@ -67,6 +120,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
         cmd+=(--na_mpnn_model_path "$NA_MPNN_MODEL_PATH")
     fi
 
+    cmd+=(--with_protein "$WITH_PROTEIN")
     # Execute the command
     "${cmd[@]}"
 done

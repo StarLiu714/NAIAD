@@ -7,12 +7,16 @@
 #SBATCH --error=logs/%A_%a.err
 #SBATCH --job-name=predict_specificities
 
+source /home/akubaney/projects/na_mpnn/.venv/bin/activate
+
 CSV_FILE=$1
 OUTPUT_DIR=$2
 METHOD=$3
 NUM_SAMPLES=${4:-}
 TEMPERATURE=${5:-}
 NA_MPNN_MODEL_PATH=${6:-}
+FAMILY_CSV=${7:-}
+FAMILY=${8:-}
 
 # 1) sanity check
 if [[ ! -f "$CSV_FILE" ]]; then
@@ -20,12 +24,28 @@ if [[ ! -f "$CSV_FILE" ]]; then
     exit 1
 fi
 
-# 2) read all structure_path values via Python csv.DictReader
+# If FAMILY is set, FAMILY_CSV must also be set and exist.
+if [[ -n "$FAMILY" && ( -z "$FAMILY_CSV" || ! -f "$FAMILY_CSV" ) ]]; then
+    echo "FAMILY '$FAMILY' specified but FAMILY_CSV '$FAMILY_CSV' not found!" >&2
+    exit 1
+fi
+
+# 2) read all structure_path values via Python csv.DictReader, optionally
+# subsetting to structures whose id appears in FAMILY_CSV with family == FAMILY.
 mapfile -t STRUCTURE_PATHS < <(
-    python - "$CSV_FILE" <<'PYCODE'
+    python - "$CSV_FILE" "$FAMILY_CSV" "$FAMILY" <<'PYCODE'
 import sys, pandas as pd
 
-df = pd.read_csv(sys.argv[1])
+structure_csv_path = sys.argv[1]
+family_csv_path = sys.argv[2]
+family = sys.argv[3]
+
+df = pd.read_csv(structure_csv_path)
+
+if family:
+    family_df = pd.read_csv(family_csv_path)
+    matching_ids = set(family_df.loc[family_df['family'] == family, 'id'])
+    df = df[df['id'].isin(matching_ids)]
 
 for p in df['structure_path']:
     print(p)
@@ -34,7 +54,7 @@ PYCODE
 
 total=${#STRUCTURE_PATHS[@]}
 if (( total == 0 )); then
-    echo "No data rows found in CSV." >&2
+    echo "No data rows found in CSV (after family filter, if any)." >&2
     exit 1
 fi
 
@@ -61,7 +81,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     if [[ -n "$NUM_SAMPLES" ]]; then
         cmd+=(--num_samples "$NUM_SAMPLES")
     fi
-    
+
     if [[ -n "$TEMPERATURE" ]]; then
         cmd+=(--temperature "$TEMPERATURE")
     fi

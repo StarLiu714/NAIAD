@@ -6,16 +6,27 @@ import argparse
 import ast
 import copy
 import gzip
+import hashlib
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
 import tempfile
 
+
 # Third-Party Libraries
 import numpy as np
 import pandas as pd
+
+import biotite
+import biotite.structure
+
+import atomworks
+import atomworks.io.utils.io_utils
+from atomworks.enums import ChainType
+from atomworks.ml.utils.token import get_token_starts
 
 ################################################################################
 # Common Functions
@@ -79,6 +90,7 @@ def read_json_file(path):
     """
     with open(path, mode = "rt") as f:
         contents = json.load(f)
+        contents = deserialize_json_enums(contents)
         return contents
 
 def write_json_file(path, contents):
@@ -94,7 +106,52 @@ def write_json_file(path, contents):
         Writes the contents to the file at the given path.
     """
     with open(path, mode = "wt") as f:
-        json.dump(contents, f, indent = 4)
+        json.dump(serialize_json_enums(contents), f, indent = 4)
+
+def serialize_json_enums(contents):
+    """
+    Recursively converts enum values into JSON-safe tagged dictionaries.
+
+    Args:
+        contents (any): The contents to serialize.
+
+    Returns:
+        serialized_contents (any): The serialized contents.
+    """
+    if isinstance(contents, ChainType):
+        return {"__type__": "ChainType", "name": contents.name}
+    if isinstance(contents, dict):
+        return {
+            key: serialize_json_enums(value)
+            for key, value in contents.items()
+        }
+    if isinstance(contents, (list, tuple)):
+        return [serialize_json_enums(value) for value in contents]
+    return contents
+
+def deserialize_json_enums(contents):
+    """
+    Recursively restores tagged enum values loaded from JSON.
+
+    Args:
+        contents (any): The JSON-loaded contents.
+
+    Returns:
+        deserialized_contents (any): The deserialized contents.
+    """
+    if isinstance(contents, dict):
+        if (
+            contents.get("__type__") == "ChainType" and
+            set(contents.keys()) == {"__type__", "name"}
+        ):
+            return ChainType[contents["name"]]
+        return {
+            key: deserialize_json_enums(value)
+            for key, value in contents.items()
+        }
+    if isinstance(contents, list):
+        return [deserialize_json_enums(value) for value in contents]
+    return contents
 
 def read_fasta_file(path):
     """
@@ -269,26 +326,229 @@ def compute_human_readable_true_sequence(specificity_data,
     Returns:
         true_sequence (list): The true sequence in a human-readable format.
     """
-    true_sequence_na_mpnn_format = specificity_data[true_sequence_na_mpnn_format_key]
+    true_sequence_na_mpnn_format = specificity_data[
+        true_sequence_na_mpnn_format_key
+    ]
     mask = specificity_data["mask"]
     if ppm_polymer_type == "dna":
         polymer_mask = specificity_data["dna_mask"]
         restype_to_int = NAConstants.deep_pbs_restype_to_int
     elif ppm_polymer_type == "rna":
         if method == "deeppbs":
-            raise ValueError("DeepPBS does not support RNA specificity prediction.")
+            raise ValueError(
+                "DeepPBS does not support RNA specificity prediction."
+            )
         polymer_mask = specificity_data["rna_mask"]
         restype_to_int = NAConstants.rna_restype_to_int
     else:
         raise ValueError(f"Invalid polymer type: {ppm_polymer_type}")
     
-    # Convert the true sequence to the appropriate format.
-    true_sequence = true_sequence[np.logical_and(mask == 1, polymer_mask == 1)]
-    true_sequence = list(map(lambda restype_int:
-        restype_to_int[NAConstants.na_mpnn_int_to_restype[restype_int]],
-        true_sequence_na_mpnn_format))
+    # Subset by mask and polymer mask.
+    true_sequence = true_sequence_na_mpnn_format[
+        np.logical_and(mask == 1, polymer_mask == 1)
+    ]
+
+    # Convert to the (possibly shared token) representation.
+    true_sequence = [
+        NAConstants.na_mpnn_int_to_restype[restype_int]
+        for restype_int in true_sequence
+    ]
+
+    # If shared token representation is used and the polymer type is RNA,
+    # convert from shared to RNA tokens.
+    if NAConstants.na_mpnn_na_shared_tokens and ppm_polymer_type == "rna":
+        true_sequence = [
+            NAConstants.dna_restype_to_rna_restype[restype]
+            for restype in true_sequence 
+        ]
 
     return true_sequence
+
+def load_first_assembly_parsed_and_atom_array(
+    structure_path,
+    add_missing_atoms = True
+):
+    """
+    Load the first bioassembly if present, otherwise load the asymmetric unit.
+
+    Args:
+        structure_path (str or file-like): The path to the structure file to
+            load, or a file-like object containing the structure text.
+        add_missing_atoms (bool): Whether AtomWorks should add missing atoms
+            while parsing. True by default.
+
+    Returns:
+        parsed (dict): The parsed structure dictionary.
+        atom_array (atomworks AtomArray): The atom array for the first
+            bioassembly if present, otherwise the atom array for the asymmetric
+            unit.
+    """
+    structure_suffix = None
+    if isinstance(structure_path, (str, os.PathLike)):
+        structure_suffix = pathlib.Path(structure_path).suffix.lower()
+    elif hasattr(structure_path, "name"):
+        structure_suffix = pathlib.Path(structure_path.name).suffix.lower()
+
+    # PDB input is already de-symmetrized for evaluation and may intentionally
+    # keep non-canonical residues in polymer chains. AtomWorks' top-level PDB
+    # parser rewrites mixed polymer/non-polymer chains into separate chains,
+    # so for PDB files we load the raw AtomArray first and then derive the
+    # usual annotations with parse_atom_array().
+    if structure_suffix == ".pdb":
+        raw_atom_array = atomworks.io.utils.io_utils.load_any(
+            structure_path,
+            model = 1,
+            altloc = "first",
+            extra_fields = ["b_factor", "occupancy", "charge", "atom_id"]
+        )
+        try:
+            parsed = atomworks.io.parser.parse_atom_array(
+                raw_atom_array,
+                _cif_file = None,
+                add_missing_atoms = add_missing_atoms,
+                fix_formal_charges = add_missing_atoms
+            )
+        except Exception:
+            # Handle a particular edge case ligand.
+            parsed = atomworks.io.parser.parse_atom_array(
+                raw_atom_array,
+                _cif_file = None,
+                add_missing_atoms = add_missing_atoms,
+                fix_formal_charges = add_missing_atoms,
+                remove_ccds = ["SPW"]
+            )
+    else:
+        # Load the structure.
+        try:
+            parsed = atomworks.io.parser.parse(
+                structure_path,
+                add_missing_atoms = add_missing_atoms,
+                fix_formal_charges = add_missing_atoms
+            )
+        except Exception:
+            # Handle a particular edge case ligand.
+            parsed = atomworks.io.parser.parse(
+                structure_path,
+                add_missing_atoms = add_missing_atoms,
+                fix_formal_charges = add_missing_atoms,
+                remove_ccds = ["SPW"]
+            )
+
+    # Use the first bioassembly if it exists, otherwise fall back to the
+    # asymmetric unit.
+    if ("assemblies" in parsed) and (len(parsed["assemblies"]) > 0):
+        first_assembly_id = list(parsed["assemblies"].keys())[0]
+        atom_array = parsed["assemblies"][first_assembly_id][0]
+    else:
+        atom_array = parsed["asym_unit"][0]
+
+    return parsed, atom_array
+
+
+def load_first_assembly_atom_array(structure_path,
+                                   add_missing_atoms = True):
+    """
+    Load the first bioassembly if present, otherwise load the asymmetric unit.
+
+    Args:
+        structure_path (str or file-like): The path to the structure file to
+            load, or a file-like object containing the structure text.
+        add_missing_atoms (bool): Whether AtomWorks should add missing atoms
+            while parsing. True by default.
+
+    Returns:
+        atom_array (atomworks AtomArray): The atom array for the first
+            bioassembly if present, otherwise the atom array for the asymmetric
+            unit.
+    """
+    _, atom_array = load_first_assembly_parsed_and_atom_array(
+        structure_path,
+        add_missing_atoms = add_missing_atoms
+    )
+
+    return atom_array
+
+def save_nucleic_acid_chains_from_structure(
+    input_structure_path, 
+    output_directory
+):
+    """
+    Given a structure file path, extracts the nucleic acid chains from the
+    structure and saves them as separate CIF files in the specified output
+    directory.
+
+    Args:
+        input_structure_path (str): The path to the input structure file.
+        output_directory (str): The directory where the extracted nucleic acid 
+            chain files will be saved.
+
+    Side Effects:
+        Saves the extracted nucleic acid chains as separate CIF files in the
+        specified output directory. The files will be named as
+        "output_directory/PDBID[1:3]/PDBID_CHAINID.cif".
+    """
+    # Setup path objects.
+    input_structure_path = pathlib.Path(input_structure_path)
+    output_directory = pathlib.Path(output_directory)
+
+    # Extract PDB ID.
+    pdb_id = input_structure_path.name.split(".")[0]
+    
+    # Load the structure.
+    try:
+        atom_array = atomworks.io.parser.parse(
+            input_structure_path
+        )["asym_unit"][0]
+    except:  
+        atom_array = atomworks.io.parser.parse(
+            input_structure_path,
+            remove_ccds = ["SPW"] # removed for edge case with 1v9g
+        )["asym_unit"][0]
+
+    # Extract nucleic acid chain IDs.
+    nucleic_acid_mask = np.isin(
+        atom_array.chain_type,
+        (ChainType.DNA, ChainType.RNA, ChainType.DNA_RNA_HYBRID)
+    )
+    nucleic_acid_chain_ids = set(atom_array.chain_id[nucleic_acid_mask])
+
+    # Setup the output directory.
+    chain_output_directory = output_directory / pdb_id[1:3]
+    chain_output_directory.mkdir(parents = True, exist_ok = True)
+
+    # Save each nucleic acid chain as a separate CIF file.
+    for chain_id in nucleic_acid_chain_ids:
+        # Subset to the current chain.
+        chain_mask = (atom_array.chain_id == chain_id)
+        chain_atom_array = atom_array[chain_mask]
+
+        # Create output path and parent directories.
+        chain_output_path = chain_output_directory / f"{pdb_id}_{chain_id}.cif"
+
+        # Save the chain as a CIF file.
+        atomworks.io.utils.io_utils.to_cif_file(
+            chain_atom_array,
+            chain_output_path,
+            include_nan_coords = False,
+            include_entity_poly = False
+        )
+
+def stable_sequence_hash(sequence,
+                         hash_length = 16):
+    """
+    Given a sequence, computes a stable SHA256-based hash prefix for use in
+    cache and file names.
+
+    Args:
+        sequence (str): The sequence to hash.
+        hash_length (int): The number of hexadecimal characters to keep.
+
+    Returns:
+        sequence_hash (str): The stable hash prefix.
+    """
+    sequence_hash = hashlib.sha256(sequence.encode("utf-8")).hexdigest()
+    truncated_sequence_hash = sequence_hash[:hash_length]
+    return truncated_sequence_hash
 
 ################################################################################
 # Constants
@@ -303,8 +563,19 @@ class NAConstants:
     ]
     rna_restype_to_int = dict(zip(rna_restypes, range(len(rna_restypes))))
 
+    # 1 letter codes for DNA residues.
+    dna_restypes = [
+        "A",
+        "C",
+        "G",
+        "T",
+    ]
+    dna_restype_to_int = dict(zip(dna_restypes, range(len(dna_restypes))))
+
     # Unknown residues.
     rna_unknown_restype = "X"
+    dna_unknown_restype = "X"
+    protein_unknown_restype = "X"
     dssr_unknown_restype = "?"
 
     # Chain break characters.
@@ -315,13 +586,53 @@ class NAConstants:
     # base residue.
     dssr_modified_restypes = [rna_restype.lower() for rna_restype in rna_restypes]
 
-    # NA-MPNN RNA residue type mapping.
+    # NA-MPNN RNA residue type mapping (lowercase NA-MPNN tokens to standard).
     na_mpnn_rna_restype_to_rna_restype = {
         "b": "A",
         "d": "C",
         "h": "G",
         "u": "U",
         "y": "X"
+    }
+
+    # NA-MPNN DNA residue type mapping (lowercase NA-MPNN tokens to standard).
+    na_mpnn_dna_restype_to_dna_restype = {
+        "a": "A",
+        "c": "C",
+        "g": "G",
+        "t": "T",
+        "x": "X"
+    }
+
+    # Character sets for classifying chain segments from NA-MPNN FASTA output.
+    na_mpnn_dna_chars = set("acgtx")
+    na_mpnn_rna_chars = set("bdhuy")
+    na_mpnn_protein_chars = set("ACDEFGHIKLMNPQRSTVWYX")
+    na_mpnn_na_chars = na_mpnn_dna_chars.union(na_mpnn_rna_chars)
+
+    # Protein 3-letter residue name to 1-letter code mapping.
+    protein_resname_to_one_letter = {
+        "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+        "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+        "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+        "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+        "UNK": "X",
+    }
+
+    # DNA 3-letter residue name to 1-letter code mapping.
+    dna_resname_to_one_letter = {
+        "DA": "A", "DC": "C", "DG": "G", "DT": "T", "DX": "X",
+    }
+
+    # DNA 1-letter code to 3-letter residue name mapping.
+    dna_one_letter_to_resname = {
+        one_letter: resname
+        for resname, one_letter in dna_resname_to_one_letter.items()
+    }
+
+    # RNA 3-letter residue name to 1-letter code mapping.
+    rna_resname_to_one_letter = {
+        "A": "A", "C": "C", "G": "G", "U": "U", "RX": "X",
     }
 
     # NA-MPNN na shared token representation.
@@ -368,12 +679,19 @@ class NAConstants:
     na_mpnn_restype_to_int = dict(zip(na_mpnn_restypes, range(len(na_mpnn_restypes))))
     na_mpnn_int_to_restype = dict(zip(range(len(na_mpnn_restypes)), na_mpnn_restypes))
 
+    dna_restype_to_rna_restype = dict()
     if na_mpnn_na_shared_tokens:
         na_mpnn_restype_to_int["A"] = na_mpnn_restype_to_int["DA"]
         na_mpnn_restype_to_int["C"] = na_mpnn_restype_to_int["DC"]
         na_mpnn_restype_to_int["G"] = na_mpnn_restype_to_int["DG"]
         na_mpnn_restype_to_int["U"] = na_mpnn_restype_to_int["DT"]
         na_mpnn_restype_to_int["RX"] = na_mpnn_restype_to_int["DX"]
+
+        dna_restype_to_rna_restype["DA"] = "A"
+        dna_restype_to_rna_restype["DC"] = "C"
+        dna_restype_to_rna_restype["DG"] = "G"
+        dna_restype_to_rna_restype["DT"] = "U"
+        dna_restype_to_rna_restype["DX"] = "RX"
     
     # DeepPBS restype ordering.
     deep_pbs_restypes = [
@@ -434,94 +752,626 @@ class NAConstants:
     open_to_close = {pair_symbols[0]: pair_symbols[1] for pair_symbols in pair_symbols_list}
     close_to_open = {pair_symbols[1]: pair_symbols[0] for pair_symbols in pair_symbols_list}
 
+    noncanonical_na_resname_to_canonical_resname = {
+        "PGP": {
+            ChainType.RNA: "G",
+        },
+        "CH": {
+            ChainType.RNA: "C",
+        },
+        "CBR": {
+            ChainType.DNA: "DC",
+        },
+        "BRU": {
+            ChainType.DNA: "DT",
+        },
+        "FHU": {
+            ChainType.RNA: "U",
+        },
+        "5CM": {
+            ChainType.DNA: "DC",
+        },
+        "A23": {
+            ChainType.RNA: "A",
+        },
+        "6MA": {
+            ChainType.DNA: "DA",
+        },
+        # 3DR is abasic (1',2'-dideoxyribose-5'-phosphate); DA is not a correct
+        # cast but is only used at positions that will be redesigned, so the
+        # input restype does not matter for NA-MPNN.
+        "3DR": {
+            ChainType.DNA: "DA",
+        },
+    }
+
+    dna_backbone_atom_names = {
+        "P",
+        "OP1",
+        "OP2",
+        "O5'",
+        "C5'",
+        "C4'",
+        "O4'",
+        "C3'",
+        "O3'",
+        "C2'",
+        "C1'",
+    }
+    rna_backbone_atom_names = dna_backbone_atom_names.union({"O2'"})
+
+    na_resname_to_allowed_atom_names = {
+        "DA": dna_backbone_atom_names.union(
+            {"N9", "C8", "N7", "C5", "C6", "N6", "N1", "C2", "N3", "C4"}
+        ),
+        "DC": dna_backbone_atom_names.union(
+            {"N1", "C2", "O2", "N3", "C4", "N4", "C5", "C6"}
+        ),
+        "DG": dna_backbone_atom_names.union(
+            {"N9", "C8", "N7", "C5", "C6", "O6", "N1", "C2", "N2", "N3", "C4"}
+        ),
+        "DT": dna_backbone_atom_names.union(
+            {"N1", "C2", "O2", "N3", "C4", "O4", "C5", "C6", "C7"}
+        ),
+        "A": rna_backbone_atom_names.union(
+            {"N9", "C8", "N7", "C5", "C6", "N6", "N1", "C2", "N3", "C4"}
+        ),
+        "C": rna_backbone_atom_names.union(
+            {"N1", "C2", "O2", "N3", "C4", "N4", "C5", "C6"}
+        ),
+        "G": rna_backbone_atom_names.union(
+            {"N9", "C8", "N7", "C5", "C6", "O6", "N1", "C2", "N2", "N3", "C4"}
+        ),
+        "U": rna_backbone_atom_names.union(
+            {"N1", "C2", "O2", "N3", "C4", "O4", "C5", "C6"}
+        ),
+    }
+
 ################################################################################
 # Sequence and Structure Standardization
 ################################################################################
-def check_rna_sequence_validity(sequence, 
-                                unknown_residue_allowed,
-                                chain_breaks_allowed):
+def require_chain_type_enum(chain_type):
     """
-    Given an rna sequence, checks the validity of the sequence.
+    Checks that a chain type is already normalized to a ChainType enum.
 
     Args:
-        sequence (str): The RNA sequence to check.
-        unknown_residue_allowed (bool): Whether unknown residues are allowed in
-            the sequence.
-        chain_breaks_allowed (bool): Whether chain breaks are allowed in the
-            sequence.
-    
+        chain_type (ChainType): The chain type to validate.
+
     Side Effects:
-        Raises a ValueError if the sequence is invalid.
+        Raises a TypeError if the chain type is not a ChainType enum.
     """
-    for c in sequence:
-        if c in NAConstants.rna_restype_to_int:
-            continue
-        elif unknown_residue_allowed and c == NAConstants.rna_unknown_restype:
-            continue
-        elif chain_breaks_allowed and c == NAConstants.chain_break_character:
-            continue
-        else:
-            raise ValueError(f"Invalid character in sequence: {c}")   
+    if not isinstance(chain_type, ChainType):
+        raise TypeError(
+            "Chain type must be a ChainType enum. Normalize inputs "
+            "before calling this function."
+        )
 
-def standardize_rna_sequence(sequence, 
-                             method = None,
-                             remove_chain_breaks = False):
+def require_na_chain_type(chain_type):
     """
-    Given an RNA sequence, standardizes the sequence to a canonical form.
-
-    NOTE: This method is only intended for use with RNA sequences.
+    Checks that a chain type is a nucleic acid ChainType enum.
 
     Args:
-        sequence (str): The RNA sequence to standardize.
-        method (str): The method to use for standardization.
-            Options:
-                "na_mpnn": Standardize the sequence using the NA-MPNN RNA
-                    residue type mapping.
-                "dssr": Standardize the sequence using the DSSR unknown
-                    residue and chain break characters.
-                None: no standardization.
-        remove_chain_breaks (bool): Whether to remove chain breaks from the
-            sequence. 
-            NOTE: This option should only be True if the user is certain that 
-                the sequence does not contain any chain breaks and that the
-                presence of any chain breaks is an error.
-    
-    Returns:
-        standard_sequence (str): The standardized RNA sequence.
+        chain_type (ChainType): The chain type to validate.
+
+    Side Effects:
+        Raises a TypeError or ValueError if the chain type is invalid.
     """
-    standard_sequence = []
+    require_chain_type_enum(chain_type)
+    if chain_type not in (
+        ChainType.DNA,
+        ChainType.RNA,
+        ChainType.DNA_RNA_HYBRID
+    ):
+        raise ValueError(
+            "Nucleic acid sequence data must use DNA, RNA, or DNA/RNA hybrid "
+            "chain types."
+        )
 
-    # Standardize the sequence.
-    for c in sequence:
-        # Convert the bdhuy characters from NA-MPNN to ACGUX.
-        if method == "na_mpnn" and \
-           c in NAConstants.na_mpnn_rna_restype_to_rna_restype:
-            standard_sequence.append(NAConstants.na_mpnn_rna_restype_to_rna_restype[c])
-        # Standardize the dssr unknown residue.
-        elif method == "dssr" and c == NAConstants.dssr_unknown_restype:
-            standard_sequence.append(NAConstants.rna_unknown_restype)
-        # Standardize the dssr chain break character.
-        elif method == "dssr" and c == NAConstants.dssr_chain_break_character:
-            standard_sequence.append(NAConstants.chain_break_character)
-        # DSSR represents modifications of residues with the lower case of their
-        # base residue. We convert them to the unknown residue.
-        elif method == "dssr" and c in NAConstants.dssr_modified_restypes:
-            standard_sequence.append(NAConstants.rna_unknown_restype)
+def check_na_sequence_validity(na_sequence_data,
+                               unknown_residue_allowed = False):
+    """
+    Given nucleic acid sequence data, checks that the sequences are valid.
+
+    Args:
+        na_sequence_data ((str, ChainType) list): The nucleic
+            sequence data.
+        unknown_residue_allowed (bool): Whether unknown residues are allowed.
+
+    Side Effects:
+        Raises a ValueError if the nucleic acid sequence data is invalid.
+    """
+    if len(na_sequence_data) == 0:
+        raise ValueError("Nucleic acid sequence data must not be empty.")
+
+    for chain_sequence_data in na_sequence_data:
+        if len(chain_sequence_data) != 2:
+            raise ValueError(
+                "Each nucleic acid sequence entry must contain exactly two "
+                "elements: sequence and chain type."
+            )
+
+        sequence, chain_type = chain_sequence_data
+        require_na_chain_type(chain_type)
+
+        if chain_type == ChainType.RNA:
+            valid_chars = set(NAConstants.rna_restypes)
+            if unknown_residue_allowed:
+                valid_chars.add(NAConstants.rna_unknown_restype)
+        elif chain_type == ChainType.DNA:
+            valid_chars = set(NAConstants.dna_restypes)
+            if unknown_residue_allowed:
+                valid_chars.add(NAConstants.dna_unknown_restype)
         else:
-            standard_sequence.append(c)
-            
-    # Remove chain breaks if specified.
-    if remove_chain_breaks:
-        standard_sequence = [c for c in standard_sequence if c != NAConstants.chain_break_character]
+            valid_chars = set(NAConstants.rna_restypes)
+            valid_chars.update(NAConstants.dna_restypes)
+            if unknown_residue_allowed:
+                valid_chars.add(NAConstants.rna_unknown_restype)
+                valid_chars.add(NAConstants.dna_unknown_restype)
+
+        for c in sequence:
+            if c not in valid_chars:
+                raise ValueError(
+                    f"Invalid character in {chain_type.name} sequence: {c}"
+                )
+
+def check_protein_sequence_validity(protein_sequences,
+                                    unknown_residue_allowed = False):
+    """
+    Given protein sequences, checks that the sequences are valid.
+
+    Args:
+        protein_sequences (str list): The protein sequences.
+        unknown_residue_allowed (bool): Whether unknown residues are allowed.
+
+    Side Effects:
+        Raises a ValueError if a protein sequence is invalid.
+    """
+    valid_chars = set(NAConstants.na_mpnn_protein_chars)
+    if not unknown_residue_allowed:
+        valid_chars.discard(NAConstants.protein_unknown_restype)
+
+    for protein_sequence in protein_sequences:
+        for c in protein_sequence:
+            if c not in valid_chars:
+                raise ValueError(
+                    f"Invalid character in protein sequence: {c}"
+                )
+
+def standardize_na_sequence(na_sequence_data,
+                            method = None):
+    """
+    Given nucleic acid sequence data, standardizes the sequence data to a
+    canonical representation as a list of (sequence, ChainType) tuples.
+
+    Args:
+        na_sequence_data ((str, ChainType) list): The nucleic
+            acid sequence data to standardize.
+        method (str): The method to use for sequence standardization.
+            Options:
+                "na_mpnn": Standardize the sequence using the NA-MPNN residue
+                    type mapping.
+                "dssr": Standardize the sequence using the DSSR unknown residue
+                    representation.
+                None: no standardization.
+
+    Returns:
+        standard_na_sequence_data ((str, ChainType) list): The standardized
+            nucleic acid sequence data.
+    """
+    standard_na_sequence_data = []
+    for chain_sequence_data in na_sequence_data:
+        if len(chain_sequence_data) != 2:
+            raise ValueError(
+                "Each nucleic acid sequence entry must contain exactly two "
+                "elements: sequence and chain type."
+            )
+
+        sequence, chain_type = chain_sequence_data
+        require_na_chain_type(chain_type)
+
+        standard_sequence = []
+        for c in sequence:
+            if method == "na_mpnn":
+                if (
+                    chain_type in (ChainType.DNA, ChainType.DNA_RNA_HYBRID) and
+                    c in NAConstants.na_mpnn_dna_restype_to_dna_restype
+                ):
+                    standard_sequence.append(
+                        NAConstants.na_mpnn_dna_restype_to_dna_restype[c]
+                    )
+                elif (
+                    chain_type in (ChainType.RNA, ChainType.DNA_RNA_HYBRID) and
+                    c in NAConstants.na_mpnn_rna_restype_to_rna_restype
+                ):
+                    standard_sequence.append(
+                        NAConstants.na_mpnn_rna_restype_to_rna_restype[c]
+                    )
+                else:
+                    standard_sequence.append(c)
+            elif method == "dssr":
+                if (
+                    c == NAConstants.dssr_unknown_restype or
+                    c in NAConstants.dssr_modified_restypes
+                ):
+                    standard_sequence.append(
+                        NAConstants.rna_unknown_restype 
+                        if chain_type == ChainType.RNA 
+                        else NAConstants.dna_unknown_restype
+                    )
+                else:
+                    standard_sequence.append(c)
+            else:
+                standard_sequence.append(c)
+
+        standard_na_sequence_data.append(
+            ("".join(standard_sequence), chain_type)
+        )
+
+    check_na_sequence_validity(
+        standard_na_sequence_data,
+        unknown_residue_allowed = True
+    )
+
+    return standard_na_sequence_data
+
+def extract_sequences_from_structure(structure_path):
+    """
+    Given a structure file path, extracts nucleic acid and protein sequences
+    from the structure using AtomWorks.
+
+    Args:
+        structure_path (str): The path to the structure file.
+
+    Returns:
+        na_sequence_data ((str, ChainType) list): Standardized nucleic acid
+            sequence data extracted from the structure.
+        protein_sequences (str list): Protein sequences extracted from the
+            structure.
+    """
+    atom_array = load_first_assembly_atom_array(
+        structure_path,
+        add_missing_atoms = False
+    )
+
+    # Check that chain_id and chain_iid have same unique number.
+    if (
+        len(np.unique(atom_array.chain_id)) !=
+        len(np.unique(atom_array.chain_iid))
+    ):
+        raise ValueError(
+            "Number of unique chain IDs does not match number of unique chain"
+            " IIDs. This indicates a symmetry or assembly issue."
+        )
+
+    # Iterate over chains in input order.
+    ordered_chain_ids = list(dict.fromkeys(atom_array.chain_id.tolist()))
+
+    na_sequence_data = []
+    protein_sequences = []
+    for chain_id in ordered_chain_ids:
+        chain_mask = (atom_array.chain_id == chain_id)
+        chain_atom_array = atom_array[chain_mask]
+
+        # Determine chain type.
+        chain_types = np.unique(chain_atom_array.chain_type)
+        if len(chain_types) != 1:
+            raise ValueError(
+                f"Multiple chain types found for chain {chain_id} in structure "
+                f"{structure_path}: {chain_types}"
+            )
+        chain_type = ChainType.as_enum(chain_types[0])
+
+        chain_id = chain_atom_array.chain_id[0]
+
+        # Raise an error if the chain type is not one of the supported types.
+        if chain_type not in (
+            ChainType.POLYPEPTIDE_L,
+            ChainType.DNA,
+            ChainType.RNA,
+            ChainType.DNA_RNA_HYBRID
+        ):
+            raise ValueError(
+                f"Unsupported chain type {chain_type} for chain"
+                f" {chain_id} in structure {structure_path}"
+            )
+
+        # Extract residue names using token starts.
+        token_starts = get_token_starts(chain_atom_array)
+        token_ends = list(token_starts[1:]) + [len(chain_atom_array)]
+
+        sequence = []
+        for token_start, token_end in zip(token_starts, token_ends):
+            token_atom_array = chain_atom_array[token_start:token_end]
+            token_res_names = np.unique(token_atom_array.res_name)
+
+            if len(token_res_names) != 1:
+                raise ValueError(
+                    f"Multiple residue names found for token starting at index "
+                    f"{token_start} in chain {chain_id} in structure "
+                    f"{structure_path}: {token_res_names}"
+                )
+            token_res_name = token_res_names[0]
+
+            # Convert the residue name to a 1-letter code. Non-canonical
+            # residues are mapped to the unknown residue code.
+            if chain_type == ChainType.POLYPEPTIDE_L:
+                one_letter = NAConstants.protein_resname_to_one_letter.get(
+                    token_res_name,
+                    NAConstants.protein_unknown_restype
+                )
+            elif chain_type == ChainType.DNA:
+                one_letter = NAConstants.dna_resname_to_one_letter.get(
+                    token_res_name,
+                    NAConstants.dna_unknown_restype
+                )
+            elif chain_type == ChainType.RNA:
+                one_letter = NAConstants.rna_resname_to_one_letter.get(
+                    token_res_name,
+                    NAConstants.rna_unknown_restype
+                )
+            else:
+                if token_res_name in NAConstants.dna_resname_to_one_letter:
+                    one_letter = NAConstants.dna_resname_to_one_letter[
+                        token_res_name
+                    ]
+                elif token_res_name in NAConstants.rna_resname_to_one_letter:
+                    one_letter = NAConstants.rna_resname_to_one_letter[
+                        token_res_name
+                    ]
+                else:
+                    one_letter = NAConstants.dna_unknown_restype
+
+            sequence.append(one_letter)
+
+        sequence = "".join(sequence)
+        if chain_type == ChainType.POLYPEPTIDE_L:
+            protein_sequences.append(sequence)
+        else:
+            na_sequence_data.append((sequence, chain_type))
+
+    na_sequence_data = standardize_na_sequence(na_sequence_data)
+    if len(na_sequence_data) == 0:
+        raise ValueError("No nucleic acid chains found in structure.")
+
+    return na_sequence_data, protein_sequences
+
+def remove_protein_chains_from_structure(structure_path):
+    """
+    Given a structure file path, creates a temporary PDB file containing only
+    the nucleic acid chains (DNA, RNA, DNA_RNA_HYBRID) from the structure.
+
+    Args:
+        structure_path (str): The path to the input structure file.
+
+    Returns:
+        temp_pdb_path (str): The path to the temporary PDB file containing
+            only nucleic acid chains.
+        temp_directory (tempfile.TemporaryDirectory): The temporary directory
+            that owns the returned file path. The caller is responsible for
+            cleaning it up when it is no longer needed.
+    """
+    atom_array = load_first_assembly_atom_array(
+        structure_path,
+        add_missing_atoms = False
+    )
+
+    # Filter to nucleic acid chains only.
+    na_mask = np.isin(
+        atom_array.chain_type,
+        (ChainType.DNA, ChainType.RNA, ChainType.DNA_RNA_HYBRID)
+    )
+    na_atom_array = atom_array[na_mask]
+
+    if len(na_atom_array) == 0:
+        raise ValueError(
+            f"No nucleic acid chains found in structure: {structure_path}"
+        )
+
+    # Preserve the original structure stem in the temporary file name so
+    # downstream tools keep emitting stable structure-based output names.
+    structure_stem = pathlib.Path(structure_path).stem
+    temp_directory = tempfile.TemporaryDirectory()
+    temp_pdb_path = os.path.join(temp_directory.name, f"{structure_stem}.pdb")
+    pdb_string = atomworks.io.utils.io_utils.to_pdb_string(na_atom_array)
+    write_text_file(temp_pdb_path, pdb_string)
     
-    standard_sequence = "".join(standard_sequence)
+    return temp_pdb_path, temp_directory
 
-    # Check the validity of the standard sequence.
-    check_rna_sequence_validity(standard_sequence, 
-                                unknown_residue_allowed = True,
-                                chain_breaks_allowed = True)
+def canonicalize_noncanonical_na_residues(structure_path):
+    """
+    Given a structure file path, rewrites non-canonical nucleic acid residues
+    to their canonical equivalents by renaming the residue and stripping atoms
+    that do not belong to the canonical form. If the structure contains no
+    non-canonical residues, the original path is returned unchanged.
 
-    return standard_sequence
+    Args:
+        structure_path (str): The path to the input structure file.
+
+    Returns:
+        output_structure_path (str): The path to the structure file with
+            canonicalized residues. This is either the original path (if no
+            changes were needed) or a path inside a new temporary directory.
+        temp_directory (tempfile.TemporaryDirectory or None): The temporary
+            directory that owns the returned file path, or None if no changes
+            were made. The caller is responsible for cleaning it up when it is
+            no longer needed.
+    """
+    # Load the structure.
+    atom_array = load_first_assembly_atom_array(
+        structure_path,
+        add_missing_atoms = False
+    )
+
+    # Iterate over tokens and rewrite non-canonical residues.
+    token_starts = get_token_starts(atom_array)
+    token_ends = list(token_starts[1:]) + [len(atom_array)]
+    keep_mask = np.ones(len(atom_array), dtype = bool)
+    output_atom_array = atom_array.copy()
+    structure_changed = False
+    for token_start, token_end in zip(token_starts, token_ends):
+        # Grab the atom array for the current token.
+        token_atom_array = atom_array[token_start : token_end]
+
+        # Determine the chain type for the token, skip non-NA tokens.
+        token_chain_types = np.unique(token_atom_array.chain_type)
+        if len(token_chain_types) != 1:
+            raise ValueError(
+                "Each token must have exactly one chain type when rewriting "
+                "non-canonical nucleic acid residues."
+            )
+        token_chain_type = ChainType.as_enum(token_chain_types[0])
+        if token_chain_type == ChainType.DNA_RNA_HYBRID:
+            if np.any(token_atom_array.atom_name == "O2'"):
+                token_chain_type = ChainType.RNA
+            else:
+                token_chain_type = ChainType.DNA
+        if token_chain_type not in (ChainType.DNA, ChainType.RNA):
+            continue
+        
+        # Determine the residue name for the token.
+        token_res_names = np.unique(token_atom_array.res_name)
+        if len(token_res_names) != 1:
+            raise ValueError(
+                "Each token must have exactly one residue name when rewriting "
+                "non-canonical nucleic acid residues."
+            )
+        token_res_name = token_res_names[0]
+
+        # Skip canonical residues.
+        if token_chain_type == ChainType.DNA and \
+           token_res_name in NAConstants.dna_resname_to_one_letter:
+            continue
+        if token_chain_type == ChainType.RNA and \
+           token_res_name in NAConstants.rna_resname_to_one_letter:
+            continue
+        
+        # Map the non-canonical residue name to a canonical residue name, and
+        # skip if there is no known mapping for this residue and chain type.
+        target_res_name = \
+            NAConstants.noncanonical_na_resname_to_canonical_resname.get(
+                token_res_name,
+                {}
+            ).get(token_chain_type)
+        if target_res_name is None:
+            continue
+        
+        # Determine which atoms to keep based on the target residue name.
+        allowed_atom_names = NAConstants.na_resname_to_allowed_atom_names[
+            target_res_name
+        ]
+        token_keep_mask = np.isin(
+            token_atom_array.atom_name,
+            list(allowed_atom_names)
+        )
+        if not np.any(token_keep_mask):
+            raise ValueError(
+                "Canonicalization removed every atom from a non-canonical NA "
+                f"residue: {token_res_name}."
+            )
+
+        # Mark atoms for removal and update residue names and hetero flags for
+        # kept atoms.
+        token_global_indices = np.arange(token_start, token_end)
+        kept_token_indices = token_global_indices[token_keep_mask]
+        keep_mask[token_global_indices[np.logical_not(token_keep_mask)]] = False
+        output_atom_array.res_name[kept_token_indices] = target_res_name
+        output_atom_array.hetero[kept_token_indices] = False
+        structure_changed = True
+
+    # If no changes were made, return the original path.
+    if not structure_changed:
+        return structure_path, None
+
+    # Clear hetero flags on all NA atoms and apply the keep mask.
+    na_mask = np.isin(
+        output_atom_array.chain_type,
+        (ChainType.DNA, ChainType.RNA, ChainType.DNA_RNA_HYBRID)
+    )
+    output_atom_array.hetero[na_mask] = False
+    output_atom_array = output_atom_array[keep_mask]
+
+    # Preserve the original structure stem in the temporary file name so
+    # downstream tools keep emitting stable structure-based output names.
+    structure_stem = pathlib.Path(structure_path).stem
+    temp_directory = tempfile.TemporaryDirectory()
+    output_structure_path = os.path.join(
+        temp_directory.name,
+        f"{structure_stem}.pdb"
+    )
+    pdb_string = atomworks.io.utils.io_utils.to_pdb_string(output_atom_array)
+    write_text_file(output_structure_path, pdb_string)
+
+    return output_structure_path, temp_directory
+
+def prepare_complex_sequence_data(na_sequence_data = None,
+                                  protein_sequences = None):
+    """
+    Validates pre-standardized nucleic acid/protein sequence data and derives
+    common sequence-context flags for design and scoring code paths.
+
+    Args:
+        na_sequence_data ((str, ChainType) list): Standardized nucleic acid
+            sequence data.
+        protein_sequences (str list): The protein sequences.
+
+    Returns:
+        result (dict): A dictionary containing derived flags.
+    """
+    if na_sequence_data is None or protein_sequences is None:
+        raise ValueError(
+            "na_sequence_data and protein_sequences are required."
+        )
+
+    check_na_sequence_validity(
+        na_sequence_data,
+        unknown_residue_allowed = True
+    )
+    if len(na_sequence_data) == 0:
+        raise ValueError("No nucleic acid chains found in sequence data.")
+    
+    protein_sequences = list(protein_sequences)
+    check_protein_sequence_validity(
+        protein_sequences,
+        unknown_residue_allowed = True
+    )
+
+    na_chain_types = [
+        chain_type
+        for _, chain_type in na_sequence_data
+    ]
+    num_na_residues = sum(
+        len(sequence) for sequence, _ in na_sequence_data
+    )
+    has_protein = len(protein_sequences) > 0
+    has_dna = any(
+        chain_type in (ChainType.DNA, ChainType.DNA_RNA_HYBRID)
+        for chain_type in na_chain_types
+    )
+    has_rna = any(
+        chain_type in (ChainType.RNA, ChainType.DNA_RNA_HYBRID)
+        for chain_type in na_chain_types
+    )
+    is_single_rna_chain = (
+        len(na_sequence_data) == 1 and
+        na_chain_types[0] == ChainType.RNA
+    )
+    is_single_dna_chain = (
+        len(na_sequence_data) == 1 and
+        na_chain_types[0] == ChainType.DNA
+    )
+    is_monomer_rna = is_single_rna_chain and not has_protein
+
+    result = {
+        "na_chain_types": na_chain_types,
+        "num_na_residues": num_na_residues,
+        "has_protein": has_protein,
+        "has_dna": has_dna,
+        "has_rna": has_rna,
+        "is_single_rna_chain": is_single_rna_chain,
+        "is_single_dna_chain": is_single_dna_chain,
+        "is_monomer_rna": is_monomer_rna,
+    }
+    return result
 
 def check_secondary_structure_validity(secondary_structure):
     """
@@ -553,6 +1403,8 @@ def standardize_secondary_structure(secondary_structure,
             Options:
                 "dssr": Standardize the secondary structure using the DSSR
                     unknown residue and chain break characters.
+                "ribonanzanet": Convert ARNIE/RibonanzaNet lettered
+                    pseudoknot symbols to the repo's default convention.
                 None: no standardization.
         replace_unknown_restypes (bool): Whether to replace unknown residues
             with loop symbols in the secondary structure. This option is only
@@ -578,6 +1430,8 @@ def standardize_secondary_structure(secondary_structure,
              remove_chain_breaks and \
              c == NAConstants.dssr_chain_break_character:
             continue
+        elif method == "ribonanzanet" and c.isalpha():
+            standard_secondary_structure.append(c.swapcase())
         else:
             standard_secondary_structure.append(c)
     
@@ -682,9 +1536,10 @@ def run_eternafold(sequence,
                 structure of the sequence.
     """
     # Check that the RNA sequence is valid.
-    check_rna_sequence_validity(sequence, 
-                                unknown_residue_allowed = False, 
-                                chain_breaks_allowed = False)
+    check_na_sequence_validity(
+        [(sequence, ChainType.RNA)],
+        unknown_residue_allowed = False
+    )
 
     # Create the input and output files for EternaFold.
     eternafold_input_file = tempfile.NamedTemporaryFile(mode = "wt")
@@ -751,9 +1606,10 @@ def run_ribonanza_net_reactivity_profile(sequence,
                 predicted reactivity profiles of the sequence for the DMS probe.
     """    
     # Check that the RNA sequence is valid.
-    check_rna_sequence_validity(sequence,
-                                unknown_residue_allowed = False,
-                                chain_breaks_allowed = False)
+    check_na_sequence_validity(
+        [(sequence, ChainType.RNA)],
+        unknown_residue_allowed = False
+    )
     
     # Create a temporary directory for the outputs, and ensure it gets removed
     # on script exit.
@@ -819,9 +1675,10 @@ def run_ribonanza_net_secondary_structure(sequence,
                 structures of the sequence.
     """    
     # Check that the RNA sequence is valid.
-    check_rna_sequence_validity(sequence,
-                                unknown_residue_allowed = False,
-                                chain_breaks_allowed = False)
+    check_na_sequence_validity(
+        [(sequence, ChainType.RNA)],
+        unknown_residue_allowed = False
+    )
     
     # Create a temporary directory for the outputs, and ensure it gets removed
     # on script exit.
@@ -868,25 +1725,90 @@ def run_ribonanza_net_secondary_structure(sequence,
 ################################################################################
 # Sequence to Predicted Structure
 ################################################################################
+def calculate_min_cross_chain_pae(chain_pair_pae_min_matrix,
+                                  chain_sequence_data):
+    """
+    Given the chain_pair_pae_min matrix from AlphaFold3 summary confidences,
+    computes the minimum PAE across protein-to-nucleic-acid chain pairs.
+
+    Args:
+        chain_pair_pae_min_matrix (list of lists): The NxN chain_pair_pae_min
+            matrix from AlphaFold3 summary_confidences.json, where N is the
+            number of chains.
+        chain_sequence_data ((str, ChainType) list): The chain sequence data
+            used to build the AlphaFold3 input.
+
+    Returns:
+        min_cross_chain_pae (float or None): The minimum protein-to-NA value in
+            the chain_pair_pae_min matrix, or None if there is no protein/NA
+            interface in the input.
+    """
+    matrix = np.array(chain_pair_pae_min_matrix)
+    n = matrix.shape[0]
+
+    if matrix.shape != (n, n):
+        raise ValueError("chain_pair_pae_min matrix must be square.")
+    if n != len(chain_sequence_data):
+        raise ValueError(
+            "chain_pair_pae_min matrix size must match the number of chains."
+        )
+
+    protein_mask = np.array(
+        [
+            chain_type == ChainType.POLYPEPTIDE_L
+            for _, chain_type in chain_sequence_data
+        ],
+        dtype = bool
+    )
+    na_mask = np.array(
+        [
+            chain_type in (
+                ChainType.DNA,
+                ChainType.RNA,
+                ChainType.DNA_RNA_HYBRID
+            )
+            for _, chain_type in chain_sequence_data
+        ],
+        dtype = bool
+    )
+
+    if not np.any(protein_mask) or not np.any(na_mask):
+        return None
+
+    protein_to_na_mask = np.logical_or(
+        np.outer(protein_mask, na_mask),
+        np.outer(na_mask, protein_mask)
+    )
+    protein_to_na_values = matrix[protein_to_na_mask]
+
+    if protein_to_na_values.size == 0:
+        return None
+
+    return float(np.min(protein_to_na_values))
+
 def run_alphafold3(name, 
-                   sequences_and_polytypes,
+                   chain_sequence_data,
                    output_dir,
                    num_diffusion_samples = 5,
                    num_seeds = 1,
                    fixed_seeds = None,
                    run_data_pipeline = False,
-                   buckets = "1",
+                   run_inference = True,
+                   precomputed_chain_data = None,
+                   buckets = "128,256,512",
+                   flash_attention_implementation = "triton",
                    alphafold3_apptainer_path = "/software/containers/users/ikalvet/mlfold3/mlfold3_01.sif",
                    alphafold3_path = "/opt/alphafold3/run_alphafold.py",
-                   model_dir = "/databases/alphafold",):
+                   model_dir = "/databases/alphafold",
+                   db_dir = "/databases/lab/af3_DB",):
     """
-    Given a name, a list of sequences and polytypes, and an output directory,
-    runs AlphaFold3 to predict the structure of the complex.
+    Given a name, chain sequence data, and an output directory, runs
+    AlphaFold3 to predict the structure of the complex.
 
     Args:
         name (str): A name of the complex.
-        sequences_and_polytypes ((str, str) list): A list of tuples, where each
-            tuple contains the sequence and polytype of a sequence.
+        chain_sequence_data ((str, ChainType) list): A list of tuples, where
+            each tuple contains the sequence and chain type for a chain.
         output_dir (str): The path to the output directory.
         num_diffusion_samples (int): The number of diffusion samples to 
             generate. Default is 5.
@@ -895,22 +1817,38 @@ def run_alphafold3(name,
         fixed_seeds (int list): A list of fixed seeds to use for the model. This
             argument is mutually exclusive with num_seeds.
         run_data_pipeline (bool): Whether to run the data pipeline (whether to
-            perform the MSA and templates searches).
+            perform the MSA and templates searches). This argument is mutually
+            exclusive with run_inference.
+        run_inference (bool): Whether to run model inference. Set to False to
+            run only the data pipeline (MSA and template search) without
+            folding. Default is True. This argument is mutually exclusive with
+            run_data_pipeline.
+        precomputed_chain_data (dict): A dictionary mapping each protein
+            sequence (str) to a dictionary containing pre-computed MSA and
+            template data with keys "unpairedMsa", "pairedMsa", and
+            "templates". Repeated protein sequences reuse the same data for
+            each occurrence. When provided, these fields are injected into
+            matching protein sequence entries of the input JSON. Default is
+            None.
         buckets (str): A comma separated list of integers. Strictly increasing 
             order of token sizes for which to cache compilations. For any input 
             with more tokens than the largest bucket size, a new bucket is 
-            created for exactly that number of tokens. The "1" bucket is a 
-            trick to ensure no padding occurs; although if running batches could
-            cause a lot of model recompilation. The alphafold3 default is
-            "256,512,768,1024,1280,1536,2048,2560,3072,3584,4096,4608,5120".
+            created for exactly that number of tokens. The alphafold3 default 
+            is "256,512,768,1024,1280,1536,2048,2560,3072,3584,4096,4608,5120".
+        flash_attention_implementation (str): The flash attention 
+            implementation to use.
         alphafold3_apptainer_path (str): The path to the AlphaFold3 apptainer
             for running AlphaFold3.
         alphafold3_path (str): The path to the AlphaFold3 run file.
         model_dir (str): The path to the AlphaFold3 model directory.
+        db_dir (str): The path to the AlphaFold3 database bundle used for the
+            data pipeline.
     
     Returns:
         result (dict): A dictionary containing:
-            json_input_path (str): The path to the input JSON file.
+            json_input_path (str): The path to the input/output JSON file
+                (contains MSA/template data after data pipeline runs).
+        Only present if run_inference is True:
             predicted_structure_path (str): The path to the predicted structure
                 file.
             predicted_confidences_path (str): The path to the predicted
@@ -918,12 +1856,22 @@ def run_alphafold3(name,
             summary_confidences_path (str): The path to the summary confidences
                 file.
             ptm (float): The predicted PTM score.
+            iptm (float or None): The predicted iPTM score. None for single
+                chain predictions.
             plddt (float): The predicted pLDDT score.
             pae (float): The predicted pAE score.
+            chain_pair_pae_min (list of lists): The NxN chain pair minimum PAE
+                matrix.
+            min_cross_chain_pae (float or None): The minimum protein-to-NA
+                chain pair value from chain_pair_pae_min.
     """
     # Check that both num_seeds and fixed_seeds are not set.
     if num_seeds is not None and fixed_seeds is not None:
         raise ValueError("Both num_seeds and fixed_seeds cannot be set at the same time.")
+    if run_data_pipeline and run_inference:
+        raise ValueError(
+            "run_data_pipeline and run_inference cannot both be True."
+        )
 
     # If the output directory for the specified name already exists,
     # raise an error.
@@ -937,18 +1885,67 @@ def run_alphafold3(name,
     else:
         # Generate random seeds.
         seed_rng = np.random.default_rng()
-        model_seeds = [int(seed_rng.integers(0, 2 ** 32 - 1)) for i in range(num_seeds)]
+        model_seeds = [
+            int(seed_rng.integers(0, 2 ** 32 - 1))
+            for _ in range(num_seeds)
+        ]
 
-    # Prepare the sequences input, with no MSA or template.
+    # Prepare the sequences input.
     sequences_input = []
-    for i, (sequence, polytype) in enumerate(sequences_and_polytypes):
+    for i, chain_sequence_data_entry in enumerate(chain_sequence_data):
+        if len(chain_sequence_data_entry) != 2:
+            raise ValueError(
+                "Each chain sequence entry must contain exactly two elements: "
+                "sequence and chain type."
+            )
+
+        sequence, chain_type = chain_sequence_data_entry
+        require_chain_type_enum(chain_type)
+
+        if chain_type == ChainType.POLYPEPTIDE_L:
+            polytype = "protein"
+        elif chain_type == ChainType.RNA:
+            check_na_sequence_validity([(sequence, chain_type)])
+            polytype = "rna"
+        elif chain_type == ChainType.DNA:
+            check_na_sequence_validity([(sequence, chain_type)])
+            polytype = "dna"
+        elif chain_type == ChainType.DNA_RNA_HYBRID:
+            raise ValueError(
+                "Unable to run AlphaFold3 on DNA/RNA hybrid chains"
+            )
+        else:
+            raise ValueError(
+                f"Unsupported chain type for AlphaFold3 input: {chain_type}"
+            )
+
         sequences_entry_dict = {
             polytype: {
                 "id": chain_num_to_chain_id(i),
                 "sequence": sequence,
-                "unpairedMsa": ""
             }
         }
+
+        # If running inference, set up the MSA and template fields.
+        if run_inference:
+            if chain_type == ChainType.POLYPEPTIDE_L:
+                sequences_entry_dict[polytype]["unpairedMsa"] = ""
+                sequences_entry_dict[polytype]["pairedMsa"] = ""
+                sequences_entry_dict[polytype]["templates"] = []
+
+                # Add pre-computed MSA and template data if available.
+                if precomputed_chain_data is not None:
+                    chain_data = precomputed_chain_data[sequence]
+
+                    sequences_entry_dict[polytype]["unpairedMsa"] = \
+                        chain_data["unpairedMsa"]
+                    sequences_entry_dict[polytype]["pairedMsa"] = \
+                        chain_data["pairedMsa"]
+                    sequences_entry_dict[polytype]["templates"] = \
+                        chain_data["templates"]
+            elif chain_type == ChainType.RNA:
+                sequences_entry_dict[polytype]["unpairedMsa"] = ""
+
         sequences_input.append(sequences_entry_dict)
 
     alphafold3_input_json_dict = {
@@ -973,11 +1970,14 @@ def run_alphafold3(name,
                 "python",
                 alphafold3_path,
                 f"--model_dir={model_dir}",
+                f"--db_dir={db_dir}",
                 f"--run_data_pipeline={run_data_pipeline}",
+                f"--run_inference={run_inference}",
                 f"--buckets={buckets}",
                 f"--num_diffusion_samples={num_diffusion_samples}",
                 f"--output_dir={output_dir}",
                 f"--json_path={temp_json_file.name}",
+                f"--flash_attention_implementation={flash_attention_implementation}",
             ],
             check = True
         )
@@ -990,13 +1990,23 @@ def run_alphafold3(name,
 
     # Process the outputs.
     json_input_path = os.path.join(name_output_directory, f"{name}_data.json")
+
+    # Check that the data JSON file exists (always produced).
+    if not os.path.exists(json_input_path):
+        raise ValueError(f"Output JSON file not found: {json_input_path}")
+
+    # If inference was not run, return only the data JSON path.
+    if not run_inference:
+        result = {
+            "json_input_path": json_input_path,
+        }
+        return result
+
     predicted_structure_path = os.path.join(name_output_directory, f"{name}_model.cif")
     predicted_confidences_path = os.path.join(name_output_directory, f"{name}_confidences.json")
     summary_confidences_path = os.path.join(name_output_directory, f"{name}_summary_confidences.json")
 
     # Check that the output files exist.
-    if not os.path.exists(json_input_path):
-        raise ValueError(f"Output JSON file not found: {json_input_path}")
     if not os.path.exists(predicted_structure_path):
         raise ValueError(f"Predicted structure file not found: {predicted_structure_path}")
     if not os.path.exists(predicted_confidences_path):
@@ -1007,6 +2017,12 @@ def run_alphafold3(name,
     # Extract confidence scores.
     summary_confidences_dict = read_json_file(summary_confidences_path)
     ptm = summary_confidences_dict["ptm"]
+    iptm = summary_confidences_dict["iptm"]
+    chain_pair_pae_min = summary_confidences_dict["chain_pair_pae_min"]
+    min_cross_chain_pae = calculate_min_cross_chain_pae(
+        chain_pair_pae_min,
+        chain_sequence_data
+    )
 
     predicted_confidences_dict = read_json_file(predicted_confidences_path)
 
@@ -1023,7 +2039,10 @@ def run_alphafold3(name,
         "summary_confidences_path": summary_confidences_path,
         "ptm": ptm,
         "plddt": plddt,
-        "pae": pae
+        "pae": pae,
+        "iptm": iptm,
+        "chain_pair_pae_min": chain_pair_pae_min,
+        "min_cross_chain_pae": min_cross_chain_pae
     }
     
     return result
@@ -1108,6 +2127,7 @@ def run_na_mpnn_specificity(structure_path,
         tmp_directory = tempfile.TemporaryDirectory()
         output_directory = tmp_directory.name
     else:
+        tmp_directory = None
         output_directory = os.path.abspath(output_directory)
     
     # Compute the output directory for the specificity.
@@ -1189,13 +2209,13 @@ def run_na_mpnn_specificity(structure_path,
         }
 
         # Clean up the temporary directory if it was created.
-        if output_directory is None:
+        if tmp_directory is not None:
             tmp_directory.cleanup()
         
         return result
     except (subprocess.CalledProcessError, ValueError) as e:
         # Clean up the temporary directory if it was created.
-        if output_directory is None:
+        if tmp_directory is not None:
             tmp_directory.cleanup()
         raise e
 
@@ -1253,6 +2273,7 @@ def run_deeppbs(structure_path,
         tmp_directory = tempfile.TemporaryDirectory()
         output_directory = tmp_directory.name
     else:
+        tmp_directory = None
         output_directory = os.path.abspath(output_directory)
     
     # Compute the name of the structure.
@@ -1400,74 +2421,401 @@ def run_deeppbs(structure_path,
 
         # Clean up the temporary directories.
         tmp_intermediate_directory.cleanup()
-        if output_directory is None:
+        if tmp_directory is not None:
             tmp_directory.cleanup()
         
         return result
     except (subprocess.CalledProcessError, ValueError) as e:
         # Clean up the temporary directories.
         tmp_intermediate_directory.cleanup()
-        if output_directory is None:
+        if tmp_directory is not None:
+            tmp_directory.cleanup()
+        raise e
+
+def run_rclamps(structure_path,
+                output_directory = None,
+                domain_type = None,
+                rclamps_apptainer_path = "/software/containers/users/akubaney/rclamps.sif",
+                rclamps_directory = "/home/akubaney/software/rCLAMPS"):
+    """
+    Given a path to a structure, runs the rCLAMPS algorithm on the protein
+    sequence of the structure to predict the DNA specificity of the structure. 
+    The predicted PPM is aligned against the ground truth DNA chains of the
+    structure, so that the output shape matches run_na_mpnn_specificity /
+    run_deeppbs.
+
+    Args:
+        structure_path (str): The path to the tertiary structure file.
+        output_directory (str): The path to the output directory. If None, a
+            temporary directory will be created.
+        domain_type (str): The rCLAMPS domain type. Options are "zf-C2H2" and
+            "homeodomain".
+        rclamps_apptainer_path (str): The path to the rCLAMPS apptainer.
+        rclamps_directory (str): The path to the rCLAMPS root directory.
+
+    Returns:
+        result (dict): A dictionary containing:
+            input_structure_name (str): The name of the input structure.
+            input_structure_path (str): The path to the input structure.
+            name (str): The name of the input structure.
+            predicted_ppm_na_mpnn_format (np.ndarray): The predicted PPM in the
+                NA-MPNN format.
+            true_sequence_na_mpnn_format (np.ndarray): The true sequence in the
+                NA-MPNN format.
+            chain_labels (np.ndarray): The chain labels.
+            mask (np.ndarray): The mask for the structure; which residues have
+                all backbone atoms.
+            protein_mask (np.ndarray): The mask for the protein residues.
+            dna_mask (np.ndarray): The mask for the DNA residues.
+            rna_mask (np.ndarray): The mask for the RNA residues.
+            encoded_residues (str list): The string names of the residues.
+            encoded_residues_dict (dict): The dictionary mapping the string
+                names of the residues to their indices.
+            specificity_method (str): The method used for specificity
+                prediction.
+            model_weights_path (str): The path to the model weights file.
+            num_samples (int): The number of samples predicted.
+            temperature (float): The temperature used for sampling.
+    """
+    structure_path = os.path.abspath(structure_path)
+    if not os.path.exists(structure_path):
+        raise ValueError(f"Invalid structure path: {structure_path}")
+
+    if output_directory is None:
+        tmp_directory = tempfile.TemporaryDirectory()
+        output_directory = tmp_directory.name
+    else:
+        tmp_directory = None
+        output_directory = os.path.abspath(output_directory)
+
+    if domain_type not in ("zf-C2H2", "homeodomain"):
+        raise ValueError(f"Invalid rCLAMPS domain type: {domain_type}")
+
+    structure_name = os.path.splitext(os.path.basename(structure_path))[0]
+
+    specificity_output_directory = os.path.join(output_directory, "specificity")
+    if not os.path.exists(specificity_output_directory):
+        os.makedirs(specificity_output_directory)
+
+    # Extract sequences from the structure. Use the first protein chain as
+    # input to rCLAMPS.
+    na_sequence_data, protein_sequences = extract_sequences_from_structure(structure_path)
+    if len(protein_sequences) == 0:
+        raise ValueError(f"No protein chains found in structure: {structure_path}")
+    protein_sequence = protein_sequences[0]
+
+    # rCLAMPS's HMMER 2.3.2 parser truncates IDs to 10 characters in the
+    # alignment section, so pad short structure names to avoid a parser bug.
+    protein_id = structure_name + "_rclamps"
+
+    tmp_intermediate_directory = tempfile.TemporaryDirectory()
+    try:
+        # For C2H2 zinc fingers, rCLAMPS requires the hmmer table output of
+        # findDomains.py.
+        if domain_type == "zf-C2H2":
+            # Create the hmmer input fasta file.
+            protein_fasta_path = os.path.join(tmp_intermediate_directory.name, "protein.fa")
+            write_text_file(protein_fasta_path, f">{protein_id}\n{protein_sequence}\n")
+
+            # Create the expected output path for the hmmer table.
+            hmmer_table_path = os.path.join(tmp_intermediate_directory.name, "hmmer_out.txt")
+
+            # Run findDomains.py to get the hmmer table output.
+            subprocess.run(
+                [
+                    "apptainer", 
+                    "exec",
+                    "--pwd", 
+                    os.path.join(rclamps_directory, "cis_bp", "C2H2-ZF"),
+                    rclamps_apptainer_path,
+                    "python", 
+                    "findDomains.py",
+                    "--input_fasta", 
+                    protein_fasta_path,
+                    "--output_file", 
+                    hmmer_table_path
+                ],
+                check = True,
+                stdout = subprocess.DEVNULL,
+                stderr = subprocess.DEVNULL
+            )
+
+            # Create the input file for predictionExample.py.
+            prot_seq_input_path = os.path.join(
+                tmp_intermediate_directory.name, 
+                "prot_seq.txt"
+            )
+
+            # Read the hmmer table, extract the prot and coreSeq columns.
+            hmmer_table = pd.read_csv(hmmer_table_path, sep="\t")
+            prot_seq_lines = [
+                f"{row['prot']}\t{row['coreSeq']}"
+                for _, row in hmmer_table.iterrows()
+            ]
+            write_text_file(
+                prot_seq_input_path,
+                "\n".join(prot_seq_lines) + "\n"
+            )
+        # For homeodomains, rCLAMPS takes the full protein sequence as input.
+        elif domain_type == "homeodomain":
+            prot_seq_input_path = os.path.join(
+                tmp_intermediate_directory.name, 
+                "protein.fa"
+            )
+
+            write_text_file(
+                prot_seq_input_path, 
+                f">{protein_id}\n{protein_sequence}\n"
+            )
+
+        # Run predictionExample.py to produce predicted_pwms.txt.
+        prediction_output_dir = os.path.join(
+            tmp_intermediate_directory.name, 
+            "prediction_out"
+        )
+        os.makedirs(prediction_output_dir)
+
+        subprocess.run(
+            [
+                "apptainer", 
+                "exec",
+                "--pwd", 
+                os.path.join(rclamps_directory, "code"),
+                rclamps_apptainer_path,
+                "python", 
+                "predictionExample.py",
+                "--domain_type", 
+                domain_type,
+                "--protein_file", 
+                prot_seq_input_path,
+                "--output_dir", 
+                prediction_output_dir
+            ],
+            check = True,
+            stdout = subprocess.DEVNULL,
+            stderr = subprocess.DEVNULL
+        )
+
+        # Extract the predicted PPM from the output.
+        predicted_pwms_path = os.path.join(
+            prediction_output_dir,
+            "predicted_pwms.txt"
+        )
+        if not os.path.exists(predicted_pwms_path):
+            raise ValueError(
+                f"Predicted PPM file not found: {predicted_pwms_path}"
+            )
+
+        # Copy the predicted PPM file.
+        shutil.copy(
+            predicted_pwms_path,
+            os.path.join(specificity_output_directory, f"{structure_name}.txt")
+        )
+
+        # Parse predicted_pwms.txt into an L x 4 array of probabilities.
+        base_to_idx = {
+            "A": 0,
+            "C": 1,
+            "G": 2,
+            "T": 3
+        }
+        ppm_rows = {}
+        predicted_ppm_text = read_text_file(predicted_pwms_path).strip()
+        predicted_ppm_lines = predicted_ppm_text.split("\n")
+        for line in predicted_ppm_lines[1:]:
+            _, base_position, base, prob = line.strip().split("\t")
+            base_position = int(base_position)
+            if base_position not in ppm_rows:
+                ppm_rows[base_position] = [0.0] * 4
+            ppm_rows[base_position][base_to_idx[base]] = float(prob)
+        predicted_ppm = np.array(
+            [ppm_rows[i] for i in range(len(ppm_rows))],
+            dtype=np.float64
+        )
+
+        # Extract the DNA chain sequences from the structure.
+        dna_chain_sequences = [
+            seq for (seq, chain_type) in na_sequence_data
+            if chain_type == ChainType.DNA
+        ]
+        if len(dna_chain_sequences) == 0:
+            raise ValueError(
+                f"No DNA chains found in structure: {structure_path}"
+            )
+
+        # Construct the S array and chain labels array for alignment.
+        S_list = []
+        chain_labels_list = []
+        for chain_idx, dna_sequence in enumerate(dna_chain_sequences):
+            for one_letter_restype in dna_sequence:
+                restype = NAConstants.dna_one_letter_to_resname[
+                    one_letter_restype
+                ]
+                S_list.append(NAConstants.na_mpnn_restype_to_int[restype])
+                chain_labels_list.append(chain_idx)
+        S = np.array(S_list, dtype = np.int32)
+        chain_labels = np.array(chain_labels_list, dtype = np.int32)
+
+        # Create the masks for alignment.
+        total_len = len(S)
+        protein_mask = np.zeros(total_len, dtype = np.int32)
+        dna_mask = np.ones(total_len, dtype = np.int32)
+        rna_mask = np.zeros(total_len, dtype = np.int32)
+
+        # Compute the reverse complement of the predicted PPM.
+        predicted_ppm_rc = np.flip(np.flip(predicted_ppm, axis = 1), axis = 0)
+
+        # Align the predicted PPM and its reverse complement to the true
+        # sequence. ppm_mask is 1 at positions the predicted PPM covers, 0
+        # elsewhere; use it as the subject mask so scoring skips uncovered
+        # positions (rCLAMPS emits a short ~4-12 bp PPM, so most of the DNA
+        # sequence has no prediction and an all-zero aligned row).
+        aligned_ppm, ppm_mask, _, _, _, _ = align_ppms(
+            [(predicted_ppm, "dna"), (predicted_ppm_rc, "dna")],
+            S, chain_labels, protein_mask, dna_mask, rna_mask
+        )
+        mask = ppm_mask
+
+        result = {
+            "input_structure_name": structure_name,
+            "input_structure_path": structure_path,
+            "name": structure_name,
+            "predicted_ppm_na_mpnn_format": aligned_ppm,
+            "true_sequence_na_mpnn_format": S,
+            "chain_labels": chain_labels,
+            "mask": mask,
+            "protein_mask": protein_mask,
+            "dna_mask": dna_mask,
+            "rna_mask": rna_mask,
+            "encoded_residues": None,
+            "encoded_residues_dict": None,
+            "specificity_method": "rclamps",
+            "model_weights_path": None,
+            "num_samples": 1,
+            "temperature": None
+        }
+
+        tmp_intermediate_directory.cleanup()
+
+        if tmp_directory is not None:
+            tmp_directory.cleanup()
+        return result
+
+    except (subprocess.CalledProcessError, ValueError) as e:
+        tmp_intermediate_directory.cleanup()
+
+        if tmp_directory is not None:
             tmp_directory.cleanup()
         raise e
 
 ################################################################################
 # Sequence Comparison
 ################################################################################
-def calculate_sequence_recovery(reference_sequence, 
-                                subject_sequence,
-                                chain_breaks_allowed = False,
+def calculate_sequence_recovery(reference_na_sequence_data,
+                                subject_na_sequence_data,
                                 unknown_residue_allowed_in_reference = False):
     """
-    Given a reference sequence and a subject sequence, calculates the sequence 
-    recovery of the subject sequence.
+    Given reference and subject nucleic acid sequence data, calculates the
+    sequence recovery of the subject sequence.
 
     Args:
-        reference_sequence (str): The reference sequence to calculate the
-            sequence recovery against.
-        subject_sequence (str): The sequence to calculate the sequence recovery 
-            for.
-        chain_breaks_allowed (bool): Whether chain breaks are allowed in the
-            sequence.
+        reference_na_sequence_data ((str, ChainType) list): The
+            reference nucleic acid sequence data.
+        subject_na_sequence_data ((str, ChainType) list): The
+            subject nucleic acid sequence data.
         unknown_residue_allowed_in_reference (bool): Whether unknown residues
             are allowed in the reference sequence.
-    
+
     Returns:
         result (dict): A dictionary containing:
             sequence_recovery (float): The sequence recovery of the sequence.
     """
-    # Check that the subject sequence and reference sequence have the same 
-    # length.
-    if len(subject_sequence) != len(reference_sequence):
-        raise ValueError(f"Length of subject sequence ({len(subject_sequence)}) must match length of reference sequence ({len(reference_sequence)}).")
-    
-    # Check the validity of the subject sequence.
-    check_rna_sequence_validity(subject_sequence,
-                                unknown_residue_allowed = False,
-                                chain_breaks_allowed = chain_breaks_allowed)
+    check_na_sequence_validity(
+        subject_na_sequence_data,
+        unknown_residue_allowed = False
+    )
+    check_na_sequence_validity(
+        reference_na_sequence_data,
+        unknown_residue_allowed = unknown_residue_allowed_in_reference
+    )
 
-    # Check the validity of the reference sequence.
-    check_rna_sequence_validity(reference_sequence,
-                                unknown_residue_allowed = unknown_residue_allowed_in_reference,
-                                chain_breaks_allowed = chain_breaks_allowed)
-    
+    if len(subject_na_sequence_data) != len(reference_na_sequence_data):
+        raise ValueError(
+            "Number of subject nucleic acid chains must match the number of "
+            "reference nucleic acid chains."
+        )
+        
+    for chain_idx, (
+        reference_chain_sequence_data,
+        subject_chain_sequence_data
+    ) in enumerate(
+        zip(reference_na_sequence_data, subject_na_sequence_data)
+    ):
+        reference_chain_sequence, reference_chain_type = \
+            reference_chain_sequence_data
+        subject_chain_sequence, subject_chain_type = subject_chain_sequence_data
+
+        if subject_chain_type != reference_chain_type:
+            raise ValueError(
+                f"Subject nucleic acid chain type ({subject_chain_type.name}) "
+                f"must match the reference nucleic acid chain type "
+                f"({reference_chain_type.name}) "
+                f"for chain {chain_idx}."
+            )
+
+        if len(subject_chain_sequence) != len(reference_chain_sequence):
+            raise ValueError(
+                f"Length of subject chain {chain_idx} sequence "
+                f"({len(subject_chain_sequence)}) must match length of "
+                f"reference chain {chain_idx} sequence "
+                f"({len(reference_chain_sequence)})."
+            )
+
     # Calculate the number of correct residues.
     num_correct = 0
     num_residues = 0
-    for subject_residue, reference_residue in zip(subject_sequence, reference_sequence):
-        # Skip unknown residues in the reference sequence.
-        if unknown_residue_allowed_in_reference and \
-           reference_residue == NAConstants.rna_unknown_restype:
-            continue
-        # Skip chain breaks if they occur in both sequences.
-        elif chain_breaks_allowed and \
-           (subject_residue == NAConstants.chain_break_character or \
-            reference_residue == NAConstants.chain_break_character):
-            if not (subject_residue == NAConstants.chain_break_character and \
-                    reference_residue == NAConstants.chain_break_character):
-                raise ValueError("Chain breaks must occur at the same position in both sequences.")
-            continue
-        else:
+    for reference_chain_sequence_data, subject_chain_sequence_data in zip(
+        reference_na_sequence_data,
+        subject_na_sequence_data
+    ):
+        reference_chain_sequence, reference_chain_type = \
+            reference_chain_sequence_data
+        subject_chain_sequence, _ = subject_chain_sequence_data
+
+        for subject_residue, reference_residue in zip(
+            subject_chain_sequence,
+            reference_chain_sequence
+        ):
+            # Skip unknown residues in the reference sequence.
+            if reference_chain_type == ChainType.RNA:
+                reference_is_unknown = (
+                    reference_residue == NAConstants.rna_unknown_restype
+                )
+            elif reference_chain_type == ChainType.DNA:
+                reference_is_unknown = (
+                    reference_residue == NAConstants.dna_unknown_restype
+                )
+            elif reference_chain_type == ChainType.DNA_RNA_HYBRID:
+                reference_is_unknown = (
+                    reference_residue == NAConstants.rna_unknown_restype or
+                    reference_residue == NAConstants.dna_unknown_restype
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported chain type: {reference_chain_type}"
+                )
+
+            if unknown_residue_allowed_in_reference and reference_is_unknown:
+                continue
+            elif (
+                not unknown_residue_allowed_in_reference and 
+                reference_is_unknown
+            ):
+                raise ValueError(
+                    "Unknown residues are not allowed in the reference "
+                    "sequence, but an unknown residue was found."
+                )
+
             num_residues += 1
             if subject_residue == reference_residue:
                 num_correct += 1
@@ -1483,6 +2831,270 @@ def calculate_sequence_recovery(reference_sequence,
     }
 
     return result
+
+def calculate_gc_content(na_sequence_data):
+    """
+    Given nucleic acid sequence data, calculates the GC content across all
+    chains combined.
+
+    Args:
+        na_sequence_data ((str, ChainType) list): The nucleic acid
+            sequence data.
+
+    Returns:
+        gc_content (float): The fraction of G and C residues, excluding
+            unknown residues (X).
+    """
+    na_sequence_data = standardize_na_sequence(na_sequence_data)
+
+    gc_count = 0
+    total_count = 0
+
+    for chain_sequence, chain_type in na_sequence_data:
+        if chain_type == ChainType.RNA:
+            unknown_residues = {NAConstants.rna_unknown_restype}
+        elif chain_type == ChainType.DNA:
+            unknown_residues = {NAConstants.dna_unknown_restype}
+        elif chain_type == ChainType.DNA_RNA_HYBRID:
+            unknown_residues = {
+                NAConstants.rna_unknown_restype,
+                NAConstants.dna_unknown_restype
+            }
+        else:
+            raise ValueError(f"Unsupported chain type: {chain_type}")
+
+        for c in chain_sequence:
+            if c in unknown_residues:
+                continue
+            total_count += 1
+            if c in ("G", "C"):
+                gc_count += 1
+
+    if total_count == 0:
+        raise ValueError("No valid residues found for GC content calculation.")
+
+    gc_content = gc_count / total_count
+    return gc_content
+
+def calculate_na_c1_rmsd(reference_atom_array,
+                         subject_atom_array):
+    """
+    Given reference and subject atom arrays, extracts nucleic acid C1' atoms,
+    superimposes the subject onto the reference using those atoms, and
+    computes the RMSD.
+
+    Args:
+        reference_atom_array (AtomArray): The reference atom array.
+        subject_atom_array (AtomArray): The subject atom array.
+
+    Returns:
+        na_c1_rmsd (float): The C1' RMSD after C1'-based superimposition.
+    """
+    # Extract NA C1' atoms from reference.
+    reference_na_mask = np.isin(
+        reference_atom_array.chain_type,
+        (ChainType.DNA, ChainType.RNA, ChainType.DNA_RNA_HYBRID)
+    )
+    reference_c1_atom_array = reference_atom_array[
+        reference_na_mask & (reference_atom_array.atom_name == "C1'")
+    ]
+
+    # Extract NA C1' atoms from subject.
+    subject_na_mask = np.isin(
+        subject_atom_array.chain_type,
+        (ChainType.DNA, ChainType.RNA, ChainType.DNA_RNA_HYBRID)
+    )
+    subject_c1_atom_array = subject_atom_array[
+        subject_na_mask & (subject_atom_array.atom_name == "C1'")
+    ]
+
+    if len(reference_c1_atom_array) == 0 or len(subject_c1_atom_array) == 0:
+        raise ValueError("No nucleic acid C1' atoms found for RMSD.")
+    if len(reference_c1_atom_array) != len(subject_c1_atom_array):
+        raise ValueError(
+            f"NA C1' atom count mismatch: reference={len(reference_c1_atom_array)}, "
+            f"subject={len(subject_c1_atom_array)}."
+        )
+
+    # Superimpose using NA C1' atoms, and compute RMSD on the same atoms.
+    superimposed, _ = biotite.structure.superimpose(
+        reference_c1_atom_array,
+        subject_c1_atom_array
+    )
+    na_c1_rmsd = float(
+        biotite.structure.rmsd(
+            reference_c1_atom_array,
+            superimposed
+        )
+    )
+
+    return na_c1_rmsd
+
+def calculate_na_c1_lddt_gddt(reference_atom_array,
+                              subject_atom_array):
+    """
+    Given reference and subject atom arrays, extracts nucleic acid C1' atoms
+    and computes LDDT and gDDT-like scores on those atoms.
+
+    Args:
+        reference_atom_array (AtomArray): The reference atom array.
+        subject_atom_array (AtomArray): The subject atom array.
+
+    Returns:
+        result (dict): A dictionary containing:
+            c1_prime_lddt (float): The C1' LDDT score.
+            c1_prime_gddt (float): The C1' gDDT-like score.
+    """
+    # Extract NA C1' atoms from reference.
+    reference_na_mask = np.isin(
+        reference_atom_array.chain_type,
+        (ChainType.DNA, ChainType.RNA, ChainType.DNA_RNA_HYBRID)
+    )
+    reference_c1_atom_array = reference_atom_array[
+        reference_na_mask & (reference_atom_array.atom_name == "C1'")
+    ]
+
+    # Extract NA C1' atoms from subject.
+    subject_na_mask = np.isin(
+        subject_atom_array.chain_type,
+        (ChainType.DNA, ChainType.RNA, ChainType.DNA_RNA_HYBRID)
+    )
+    subject_c1_atom_array = subject_atom_array[
+        subject_na_mask & (subject_atom_array.atom_name == "C1'")
+    ]
+
+    if len(reference_c1_atom_array) == 0 or len(subject_c1_atom_array) == 0:
+        raise ValueError("No nucleic acid C1' atoms found for LDDT/GDDT.")
+    if len(reference_c1_atom_array) != len(subject_c1_atom_array):
+        raise ValueError(
+            f"NA C1' atom count mismatch: reference={len(reference_c1_atom_array)}, "
+            f"subject={len(subject_c1_atom_array)}."
+        )
+
+    c1_prime_lddt = biotite.structure.lddt(
+        reference_c1_atom_array,
+        subject_c1_atom_array
+    )
+    c1_prime_gddt = biotite.structure.lddt(
+        reference_c1_atom_array,
+        subject_c1_atom_array,
+        inclusion_radius = 10000,
+        distance_bins = (1.0, 2.0, 4.0, 8.0)
+    )
+
+    result = {
+        "c1_prime_lddt": float(c1_prime_lddt),
+        "c1_prime_gddt": float(c1_prime_gddt)
+    }
+
+    return result
+
+def calculate_protein_aligned_na_c1_rmsd(reference_atom_array,
+                                         subject_atom_array):
+    """
+    Given a reference and subject atom array (both containing protein and
+    nucleic acid chains), superimposes the structures using protein CA atoms
+    and then calculates the RMSD on nucleic acid C1' atoms.
+
+    Args:
+        reference_atom_array (AtomArray): The reference atom array containing
+            both protein and nucleic acid chains.
+        subject_atom_array (AtomArray): The subject (predicted) atom array
+            containing both protein and nucleic acid chains.
+
+    Returns:
+        protein_aligned_na_rmsd (float): The C1' RMSD after superimposition
+            on protein CA atoms.
+    """
+    # Extract protein CA atoms from reference.
+    reference_protein_mask = np.isin(
+        reference_atom_array.chain_type, (ChainType.POLYPEPTIDE_L,)
+    )
+    reference_ca_mask = reference_protein_mask & (reference_atom_array.atom_name == "CA")
+    reference_ca = reference_atom_array[reference_ca_mask]
+
+    # Extract protein CA atoms from subject.
+    subject_protein_mask = np.isin(
+        subject_atom_array.chain_type, (ChainType.POLYPEPTIDE_L,)
+    )
+    subject_ca_mask = subject_protein_mask & (subject_atom_array.atom_name == "CA")
+    subject_ca = subject_atom_array[subject_ca_mask]
+
+    # Extract NA C1' atoms from reference.
+    reference_na_mask = np.isin(
+        reference_atom_array.chain_type,
+        (ChainType.DNA, ChainType.RNA, ChainType.DNA_RNA_HYBRID)
+    )
+    reference_c1_mask = reference_na_mask & (reference_atom_array.atom_name == "C1'")
+    reference_c1 = reference_atom_array[reference_c1_mask]
+
+    # Extract NA C1' atoms from subject.
+    subject_na_mask = np.isin(
+        subject_atom_array.chain_type,
+        (ChainType.DNA, ChainType.RNA, ChainType.DNA_RNA_HYBRID)
+    )
+    subject_c1_mask = subject_na_mask & (subject_atom_array.atom_name == "C1'")
+    subject_c1 = subject_atom_array[subject_c1_mask]
+
+    if len(reference_ca) == 0 or len(subject_ca) == 0:
+        raise ValueError("No protein CA atoms found for superimposition.")
+    if len(reference_c1) == 0 or len(subject_c1) == 0:
+        raise ValueError("No nucleic acid C1' atoms found for RMSD.")
+    if len(reference_ca) != len(subject_ca):
+        raise ValueError(
+            f"Protein CA atom count mismatch: reference={len(reference_ca)}, "
+            f"subject={len(subject_ca)}."
+        )
+    if len(reference_c1) != len(subject_c1):
+        raise ValueError(
+            f"NA C1' atom count mismatch: reference={len(reference_c1)}, "
+            f"subject={len(subject_c1)}."
+        )
+
+    reference_protein_sequence = [
+        NAConstants.protein_resname_to_one_letter.get(
+            res_name,
+            NAConstants.protein_unknown_restype
+        )
+        for res_name in reference_ca.res_name
+    ]
+    subject_protein_sequence = [
+        NAConstants.protein_resname_to_one_letter.get(
+            res_name,
+            NAConstants.protein_unknown_restype
+        )
+        for res_name in subject_ca.res_name
+    ]
+    if reference_protein_sequence != subject_protein_sequence:
+        raise ValueError(
+            "Reference and subject protein sequences must match for "
+            "protein-aligned nucleic acid RMSD."
+        )
+
+    # Concatenate protein CA and NA C1' atoms into combined arrays.
+    reference_combined = reference_ca + reference_c1
+    subject_combined = subject_ca + subject_c1
+
+    # Create mask: True for protein CA atoms (used for alignment).
+    atom_mask = (reference_combined.atom_name == "CA")
+
+    # Superimpose using protein CA atoms; transformation applied to all atoms.
+    superimposed, _ = biotite.structure.superimpose(
+        reference_combined, subject_combined, atom_mask = atom_mask
+    )
+
+    # Extract the NA C1' portion from the superimposed result.
+    superimposed_c1 = superimposed[superimposed.atom_name == "C1'"]
+
+    # Compute RMSD on NA C1' only.
+    protein_aligned_na_rmsd = float(
+        biotite.structure.rmsd(
+            reference_c1,
+            superimposed_c1
+        )
+    )
+    
+    return protein_aligned_na_rmsd
 
 ################################################################################
 # Secondary Structure and Reactivity Profile Comparison
@@ -1708,7 +3320,7 @@ def run_us_align(reference_structure_path,
                  mm = 0,
                  ter = 2,
                  atom = "auto",
-                 het = 0,
+                 het = 1,
                  us_align_path = "/projects/ml/afavor/alignment/USalign"):
     """
     Given a reference structure path and a subject structure path, aligns the
@@ -1732,7 +3344,8 @@ def run_us_align(reference_structure_path,
                 1: alignment of two multi-chain oligomeric structures.
                 2: alignment of individual chains to an oligomeric structure.
                 3: alignment of circularly permuted structure.
-                4: alignment of multiple monomeric chains into a consensus alignment.
+                4: alignment of multiple monomeric chains into a consensus 
+                    alignment.
                 5: fully non-sequential (fNS) alignment.
                 6: semi-non-sequential (sNS) alignment.
                 To use -mm 1 or -mm 2, '-ter' option must be 0 or 1.
@@ -1749,7 +3362,7 @@ def run_us_align(reference_structure_path,
             the atom that will be used to align the structures.
             Options:
                 "auto": (default) " C3'" for RNA/DNA and " CA " for proteins.
-                four-character atom name: e.g. " C3'" for RNA/DNA and " CA " 
+                    four-character atom name: e.g. " C3'" for RNA/DNA and " CA " 
                     for proteins. Note, if mol is set to "auto", atom must also
                     be set to "auto". This is because it is not possible to
                     specify atoms for both protein and nucleic acids. This will
@@ -1764,14 +3377,33 @@ def run_us_align(reference_structure_path,
 
     Returns:
         result (dict): A dictionary containing:
+            loaded_subject_structure_path (str): The path to the subject
+                structure as loaded by US-Align.
+            loaded_reference_structure_path (str): The path to the reference
+                structure as loaded by US-Align.
+            loaded_subject_length (int): The length of the subject structure as
+                loaded by US-Align.
+            loaded_reference_length (int): The length of the reference 
+                structure as loaded by US-Align.
+            aligned_length (int): The length of the aligned region between the
+                subject and reference structures.
+            sequence_identity (n_identical/n_aligned) (float): The sequence 
+                identity (n_identical/n_aligned) between the subject and 
+                reference structures in the aligned region.
             rmsd (float): The root mean square deviation (RMSD) between the 
                 aligned structures.
             tm_score (float): The TM-score between the aligned structures,
                 normalized by the length of the reference structure.
+            error_sequence_too_short (bool): Whether the alignment failed due
+                to the sequence being too short.
+            error_cannot_parse_file (bool): Whether the alignment failed due to
+                US-Align being unable to parse the input structure files.
     """
     # Check that the mol and atom options agree.
     if mol == "auto" and atom != "auto":
-        raise ValueError("If mol is set to 'auto', atom must also be set to 'auto'.")
+        raise ValueError(
+            "If mol is set to 'auto', atom must also be set to 'auto'."
+        )
 
     # Convert the structure paths to absolute paths.
     subject_structure_path = os.path.abspath(subject_structure_path)
@@ -1781,10 +3413,13 @@ def run_us_align(reference_structure_path,
     if not os.path.exists(subject_structure_path):
         raise ValueError(f"Structure file not found: {subject_structure_path}")
     if not os.path.exists(reference_structure_path):
-        raise ValueError(f"Structure file not found: {reference_structure_path}")
+        raise ValueError(
+            f"Structure file not found: {reference_structure_path}"
+        )
 
     # Create a temporary file for the US-Align output.
     us_align_output_file = tempfile.NamedTemporaryFile(mode = "wt")
+    us_align_error_file = tempfile.NamedTemporaryFile(mode = "wt")
 
     # Run US-Align.
     try:
@@ -1806,33 +3441,88 @@ def run_us_align(reference_structure_path,
             ],
             check = True,
             stdout = us_align_output_file,
-            stderr = subprocess.DEVNULL
+            stderr = us_align_error_file
         )
 
         us_align_output_text = read_text_file(us_align_output_file.name)
-
+        us_align_error_text = read_text_file(us_align_error_file.name)
+    
         # Extract the TM-score and RMSD from the US-Align output.
+        loaded_subject_structure_path = None
+        loaded_reference_structure_path = None
+        loaded_subject_length = None
+        loaded_reference_length = None
+        aligned_length = None
         rmsd = None
+        sequence_identity = None
         tm_score = None
         for line in us_align_output_text.split("\n"):
-            if line.startswith("Aligned length="):
+            if line.startswith("Name of Structure_1:"):
+                loaded_subject_structure_path = line.split(
+                    "Name of Structure_1:"
+                )[1].split("(to be superimposed onto Structure_2)")[0].strip()
+            elif line.startswith("Name of Structure_2:"):
+                loaded_reference_structure_path = line.split(
+                    "Name of Structure_2:"
+                )[1].strip()
+            elif line.startswith("Length of Structure_1:"):
+                loaded_subject_length = int(line.split(
+                    "Length of Structure_1:"
+                )[1].split("residues")[0].strip())
+            elif line.startswith("Length of Structure_2:"):
+                loaded_reference_length = int(line.split(
+                    "Length of Structure_2:"
+                )[1].split("residues")[0].strip())
+            elif line.startswith("Aligned length="):
+                aligned_length = int(line.split(
+                    "Aligned length="
+                )[1].split(",")[0].strip())
                 rmsd = float(line.split("RMSD=")[1].split(",")[0].strip())
-            elif line.startswith("TM-score=") and "normalized by length of Structure_2" in line:
-                tm_score = float(line.split("TM-score=")[1].split("(normalized by length of Structure_2")[0].strip())
-        
+                sequence_identity = float(line.split(
+                    "Seq_ID=n_identical/n_aligned=")[1].strip()
+                )
+            elif (
+                line.startswith("TM-score=") and 
+                "normalized by length of Structure_2" in line
+            ):
+                tm_score = float(line.split(
+                    "TM-score="
+                )[1].split("(normalized by length of Structure_2")[0].strip())
+
+        # Close files. 
         us_align_output_file.close()
+        us_align_error_file.close()
         
-        if rmsd is None or tm_score is None:
-            raise ValueError("Failed to extract RMSD and TM-score from US-Align output.")
+        # Parse errors.
+        error_sequence_too_short = False
+        error_cannot_parse_file = False
+        if tm_score is None:
+            if "Sequence is too short" in us_align_error_text:
+                error_sequence_too_short = True
+            elif "Warning! Cannot parse file" in us_align_error_text:
+                error_cannot_parse_file = True
+            else:
+                raise ValueError(
+                    "Failed to extract RMSD and TM-score from US-Align output."
+                )
         
         result = {
+            "loaded_subject_structure_path": loaded_subject_structure_path,
+            "loaded_reference_structure_path": loaded_reference_structure_path,
+            "loaded_subject_length": loaded_subject_length,
+            "loaded_reference_length": loaded_reference_length,
+            "aligned_length": aligned_length,
+            "sequence_identity (n_identical/n_aligned)": sequence_identity,
             "rmsd": rmsd,
-            "tm_score": tm_score
+            "tm_score": tm_score,
+            "error_sequence_too_short": error_sequence_too_short,
+            "error_cannot_parse_file": error_cannot_parse_file
         }
 
         return result
     except (subprocess.CalledProcessError, ValueError) as e:
         us_align_output_file.close()
+        us_align_error_file.close()
         raise e
 
 ################################################################################
@@ -2415,6 +4105,7 @@ def run_na_mpnn_sequence(structure_path,
         tmp_directory = tempfile.TemporaryDirectory()
         output_directory = tmp_directory.name
     else:
+        tmp_directory = None
         output_directory = os.path.abspath(output_directory)
     
     # Compute the output directory for the sequences.
@@ -2498,13 +4189,13 @@ def run_na_mpnn_sequence(structure_path,
             design_data.append(design_dict)
 
         # Clean up the temporary directory if it was created.
-        if output_directory is None:
+        if tmp_directory is not None:
             tmp_directory.cleanup()
 
         return design_data
     except (subprocess.CalledProcessError, ValueError) as e:
         # Clean up the temporary directory if it was created.
-        if output_directory is None:
+        if tmp_directory is not None:
             tmp_directory.cleanup()
         raise e
     
@@ -2555,6 +4246,7 @@ def run_grnade(structure_path,
         tmp_directory = tempfile.TemporaryDirectory()
         output_directory = tmp_directory.name
     else:
+        tmp_directory = None
         output_directory = os.path.abspath(output_directory)
     
     # Compute the output directory for the sequences.
@@ -2629,13 +4321,150 @@ def run_grnade(structure_path,
             design_data.append(design_dict)
         
         # Clean up the temporary directory if it was created.
-        if output_directory is None:
+        if tmp_directory is not None:
             tmp_directory.cleanup()
 
         return design_data
     except (subprocess.CalledProcessError, ValueError) as e:
         # Clean up the temporary directory if it was created.
-        if output_directory is None:
+        if tmp_directory is not None:
+            tmp_directory.cleanup()
+        raise e
+
+def run_ridiffusion(structure_path,
+                    output_directory = None,
+                    n_samples = 1,
+                    ridiffusion_apptainer_path = "/software/containers/users/akubaney/ridiffusion.sif",
+                    ridiffusion_path = "/home/akubaney/software/RIdiffusion/seq_generator.py"):
+    """
+    Given a structure path, runs the RIdiffusion sequence design algorithm to
+    generate sequences for the structure. The output is a list of dictionaries
+    containing the design ID, name, design sequence, and tool-reported sequence
+    recovery.
+
+    Args:
+        structure_path (str): The path to the structure file.
+        output_directory (str): The path to the output directory. If not
+            specified, a temporary directory will be created.
+        n_samples (int): The number of samples to generate.
+        ridiffusion_apptainer_path (str): The path to the RIdiffusion
+            apptainer.
+        ridiffusion_path (str): The path to the RIdiffusion run file.
+    
+    Returns:
+        design_data (dict list): A list of dictionaries containing:
+            input_structure_name (str): The name of the input structure.
+            input_structure_path (str): The path to the input structure.
+            design_id (str): The design ID.
+            name (str): The name of the design.
+            design_sequence (str): The design sequence.
+            tool_reported_sequence_recovery (float): The tool-reported sequence
+                recovery.
+            design_method (str): The design method used.
+            model_weights_path (str): The path to the model weights used.
+    """
+    # Convert the structure path to an absolute path.
+    structure_path = os.path.abspath(structure_path)
+
+    # Check that the structure path exists.
+    if not os.path.exists(structure_path):
+        raise ValueError(f"Structure file not found: {structure_path}")
+    
+    # If the output directory is not specified, create a temporary directory.
+    # The temporary directory will be automatically cleaned up when the script
+    # exits.
+    if output_directory is None:
+        tmp_directory = tempfile.TemporaryDirectory()
+        output_directory = tmp_directory.name
+    else:
+        tmp_directory = None
+        output_directory = os.path.abspath(output_directory)
+    
+    # Compute the output directory for the sequences.
+    seqs_output_directory = os.path.join(output_directory, "seqs")
+
+    # Create the output directory if it does not exist.
+    os.makedirs(seqs_output_directory, exist_ok = True)
+
+    # Compute the name of the structure.
+    structure_name = os.path.splitext(os.path.basename(structure_path))[0]
+
+    fasta_path = os.path.join(seqs_output_directory, f"{structure_name}.fa")
+
+    # Run the RIdiffusion sequence design algorithm.
+    input_pdb_directory = tempfile.TemporaryDirectory()
+    try:
+        input_structure_path = os.path.join(
+            input_pdb_directory.name,
+            os.path.basename(structure_path)
+        )
+        shutil.copy(structure_path, input_structure_path)
+
+        subprocess.run(
+            [
+                "apptainer",
+                "exec",
+                "--nv",
+                ridiffusion_apptainer_path,
+                "python",
+                ridiffusion_path,
+                "--pdb_dir",
+                str(input_pdb_directory.name),
+                "--num_samples",
+                str(n_samples),
+                "--output_file",
+                str(fasta_path)
+            ],
+            check = True,
+            cwd = os.path.dirname(ridiffusion_path),
+            stdout = subprocess.DEVNULL,
+            stderr = subprocess.DEVNULL
+        )
+
+        # Check that the output fasta file exists.
+        if not os.path.exists(fasta_path):
+            raise ValueError(f"Output fasta file not found: {fasta_path}")
+
+        # Read the output fasta file.
+        fasta_entries = read_fasta_file(fasta_path)
+
+        # Skip the first entry of the fasta, which contains the parent sequence.
+        fasta_entries = fasta_entries[1:]
+
+        design_data = []
+        for fasta_header, fasta_sequence in fasta_entries:
+            fasta_header = fasta_header.strip()
+            fasta_sequence = fasta_sequence.replace("\n", "")
+
+            fasta_header_name, tool_reported_sequence_recovery = \
+                fasta_header.split("--")
+            design_id = fasta_header_name.split("_")[0].replace("seq", "")
+
+            design_dict = {
+                "input_structure_name": structure_name,
+                "input_structure_path": structure_path,
+                "design_id": design_id,
+                "name": f"{structure_name}_{design_id}",
+                "design_sequence": fasta_sequence,
+                "tool_reported_sequence_recovery": float(tool_reported_sequence_recovery),
+                "design_method": "ridiffusion",
+                "model_weights_path": ""
+            }
+
+            design_data.append(design_dict)
+
+        input_pdb_directory.cleanup()
+
+        # Clean up the temporary directory if it was created.
+        if tmp_directory is not None:
+            tmp_directory.cleanup()
+
+        return design_data
+    except (subprocess.CalledProcessError, ValueError) as e:
+        input_pdb_directory.cleanup()
+
+        # Clean up the temporary directory if it was created.
+        if tmp_directory is not None:
             tmp_directory.cleanup()
         raise e
 
@@ -2686,6 +4515,7 @@ def run_rhodesign(structure_path,
         tmp_directory = tempfile.TemporaryDirectory()
         output_directory = tmp_directory.name
     else:
+        tmp_directory = None
         output_directory = os.path.abspath(output_directory)
     
     # Compute the output directory for the sequences.
@@ -2766,13 +4596,13 @@ def run_rhodesign(structure_path,
         write_fasta_file(fasta_path, fasta_entries)
 
         # Clean up the temporary directory if it was created.
-        if output_directory is None:
+        if tmp_directory is not None:
             tmp_directory.cleanup()
 
         return design_data
     except (subprocess.CalledProcessError, ValueError) as e:
         # Clean up the temporary directory if it was created.
-        if output_directory is None:
+        if tmp_directory is not None:
             tmp_directory.cleanup()
         
         # Clean up the output file and output directory for the ith sample.
@@ -2781,21 +4611,310 @@ def run_rhodesign(structure_path,
 
         raise e
 
+def extract_na_sequence_data_from_design_sequence(design_sequence,
+                                                  design_method):
+    """
+    Given a design sequence, extracts the designed nucleic acid sequences.
+
+    Args:
+        design_sequence (str): The raw design sequence returned by the design
+            method.
+        design_method (str): The design method used.
+
+    Returns:
+        na_sequence_data ((str, ChainType) list): The designed nucleic acid
+            sequence data.
+    """
+    def infer_na_chain_type_from_na_mpnn_sequence(chain_sequence):
+        has_dna_char = False
+        has_rna_char = False
+        has_protein_char = False
+
+        for c in chain_sequence:
+            if c in NAConstants.na_mpnn_dna_chars:
+                has_dna_char = True
+            elif c in NAConstants.na_mpnn_rna_chars:
+                has_rna_char = True
+            elif c in NAConstants.na_mpnn_protein_chars:
+                has_protein_char = True
+            else:
+                raise ValueError(
+                    f"Unable to classify design chain sequence: {chain_sequence}"
+                )
+
+        # Determine chain type.
+        if not has_dna_char and not has_rna_char and has_protein_char:
+            return None
+        elif has_dna_char and not has_rna_char and not has_protein_char:
+            return ChainType.DNA
+        elif not has_dna_char and has_rna_char and not has_protein_char:
+            return ChainType.RNA
+        elif has_dna_char and has_rna_char and not has_protein_char:
+            return ChainType.DNA_RNA_HYBRID
+        elif has_protein_char:
+            raise ValueError(
+                "Unable to classify mixed protein/nucleic acid design chain "
+                f"sequence: {chain_sequence}"
+            )
+
+        raise ValueError(
+            f"Unable to classify empty design chain sequence: {chain_sequence}"
+        )
+
+    chain_sequences = design_sequence.split(NAConstants.chain_break_character)
+
+    if design_method == "na_mpnn":
+        na_sequence_data = []
+        for chain_sequence in chain_sequences:
+            if len(chain_sequence) == 0:
+                raise Exception(
+                    "Design sequence contains an empty chain sequence"
+                )
+
+            chain_type = infer_na_chain_type_from_na_mpnn_sequence(
+                chain_sequence
+            )
+            if chain_type is None:
+                continue
+
+            na_sequence_data.append((chain_sequence, chain_type))
+        
+        na_sequence_data = standardize_na_sequence(
+            na_sequence_data,
+            method = "na_mpnn"
+        )
+    elif design_method in ("grnade", "ridiffusion", "rhodesign"):
+        na_sequence_data = []
+        for chain_sequence in chain_sequences:
+            if len(chain_sequence) == 0:
+                raise Exception(
+                    "Design sequence contains an empty chain sequence"
+                )
+            
+            na_sequence_data.append((chain_sequence, ChainType.RNA))
+        
+        na_sequence_data = standardize_na_sequence(na_sequence_data)
+    else:
+        raise ValueError(f"Invalid sequence design method: {design_method}")
+
+    # Designed NA sequences must be concrete; downstream design processing does
+    # not treat unknown residues as valid outputs.
+    check_na_sequence_validity(
+        na_sequence_data,
+        unknown_residue_allowed = False
+    )
+
+    return na_sequence_data
+
 ################################################################################
 # Combined Functionality
 ################################################################################
+
+def find_best_reference_overlap(reference_na_sequence_data,
+                                subject_na_sequence_data,
+                                reference_atom_array,
+                                subject_atom_array,
+                                use_protein_alignment = False):
+    """
+    Given single-chain reference and subject nucleic acid sequence data where
+    the subject is shorter, finds the best-overlapping reference subsequence.
+
+    Args:
+        reference_na_sequence_data ((str, ChainType) list): The reference
+            nucleic acid sequence data.
+        subject_na_sequence_data ((str, ChainType) list): The subject nucleic
+            acid sequence data.
+        reference_atom_array (AtomArray): The reference atom array. For
+            protein-aligned mode, this should contain both protein and nucleic
+            acid atoms. Otherwise the nucleic acid atoms are used and C1'
+            atoms are selected internally for RMSD scoring.
+        subject_atom_array (AtomArray): The subject atom array, following the
+            same convention as reference_atom_array.
+        use_protein_alignment (bool): Whether to score overlaps using
+            protein-aligned NA RMSD. Default is False.
+
+    Returns:
+        result (dict): A dictionary containing:
+            best_start_idx (int): The starting residue index of the best
+                overlap in the reference sequence.
+            best_end_idx (int): The exclusive ending residue index of the best
+                overlap in the reference sequence.
+            best_rmsd (float): The RMSD of the best overlap.
+            reference_atom_array (AtomArray): The reference atom array trimmed
+                to the best overlap.
+            reference_na_sequence_data ((str, ChainType) list): The trimmed
+                reference nucleic acid sequence data for scoring.
+    """
+    if len(reference_na_sequence_data) != 1 or len(subject_na_sequence_data) != 1:
+        raise ValueError(
+            "Best-overlap alignment only supports single-chain nucleic acid "
+            "sequence data."
+        )
+
+    reference_sequence, reference_chain_type = reference_na_sequence_data[0]
+    subject_sequence, subject_chain_type = subject_na_sequence_data[0]
+
+    if subject_chain_type != reference_chain_type:
+        raise ValueError(
+            "Subject nucleic acid chain type must match the reference chain "
+            "type for best-overlap alignment."
+        )
+
+    reference_sequence_length = len(reference_sequence)
+    subject_sequence_length = len(subject_sequence)
+    if subject_sequence_length >= reference_sequence_length:
+        raise ValueError(
+            "Best-overlap alignment requires the subject sequence to be "
+            "shorter than the reference sequence."
+        )
+
+    reference_na_atom_array = reference_atom_array[
+        np.isin(
+            reference_atom_array.chain_type,
+            (ChainType.DNA, ChainType.RNA, ChainType.DNA_RNA_HYBRID)
+        )
+    ]
+    subject_na_atom_array = subject_atom_array[
+        np.isin(
+            subject_atom_array.chain_type,
+            (ChainType.DNA, ChainType.RNA, ChainType.DNA_RNA_HYBRID)
+        )
+    ]
+    reference_na_token_starts = get_token_starts(reference_na_atom_array)
+    subject_na_token_starts = get_token_starts(subject_na_atom_array)
+
+    if len(reference_na_token_starts) != reference_sequence_length or \
+       len(subject_na_token_starts) != subject_sequence_length:
+        raise ValueError(
+            "Unable to align shorter nucleic acid sequences because the "
+            "nucleic acid residue counts do not match the sequence "
+            "lengths."
+        )
+
+    reference_na_token_ends = (
+        list(reference_na_token_starts[1:]) +
+        [len(reference_na_atom_array)]
+    )
+
+    if use_protein_alignment:
+        reference_protein_atom_array = reference_atom_array[
+            reference_atom_array.chain_type == ChainType.POLYPEPTIDE_L
+        ]
+
+    best_rmsd = None
+    best_start_idx = None
+    best_reference_atom_array = None
+    for possible_start_idx in range(
+        reference_sequence_length - subject_sequence_length + 1
+    ):
+        possible_end_idx = possible_start_idx + subject_sequence_length
+        reference_start_idx = reference_na_token_starts[possible_start_idx]
+        reference_end_idx = reference_na_token_ends[possible_end_idx - 1]
+
+        if use_protein_alignment:
+            candidate_reference_atom_array = (
+                reference_protein_atom_array +
+                reference_na_atom_array[reference_start_idx : reference_end_idx]
+            )
+            candidate_rmsd = calculate_protein_aligned_na_c1_rmsd(
+                candidate_reference_atom_array,
+                subject_atom_array
+            )
+        else:
+            candidate_reference_atom_array = reference_na_atom_array[
+                reference_start_idx : reference_end_idx
+            ]
+            candidate_rmsd = calculate_na_c1_rmsd(
+                candidate_reference_atom_array,
+                subject_atom_array
+            )
+
+        if best_rmsd is None or candidate_rmsd < best_rmsd:
+            best_rmsd = candidate_rmsd
+            best_start_idx = possible_start_idx
+            best_reference_atom_array = candidate_reference_atom_array
+
+    best_end_idx = best_start_idx + subject_sequence_length
+    result = {
+        "best_start_idx": best_start_idx,
+        "best_end_idx": best_end_idx,
+        "best_rmsd": float(best_rmsd),
+        "reference_atom_array": best_reference_atom_array,
+        "reference_na_sequence_data": [
+            (
+                reference_sequence[best_start_idx : best_end_idx],
+                reference_chain_type
+            )
+        ],
+    }
+    
+    return result
+
+def trim_reference_dssr_output_to_overlap(reference_dssr_output,
+                                          best_start_idx,
+                                          best_end_idx):
+    """
+    Retained helper for legacy best-overlap scoring of monomer RNA designs.
+    This is currently unused.
+
+    Given a DSSR output dictionary and overlap bounds on the reference
+    sequence, trims the sequence and secondary structure to the selected
+    overlap. Base pairs that extend outside the overlap are first converted to
+    loops before trimming.
+
+    Args:
+        reference_dssr_output (dict): DSSR output containing "sequence" and
+            "secondary_structure".
+        best_start_idx (int): Inclusive starting residue index of the overlap.
+        best_end_idx (int): Exclusive ending residue index of the overlap.
+
+    Returns:
+        trimmed_reference_dssr_output (dict): A shallow copy of the DSSR output
+            with the sequence and secondary structure trimmed to the overlap.
+    """
+    trimmed_reference_dssr_output = dict(reference_dssr_output)
+    trimmed_reference_dssr_output["sequence"] = \
+        trimmed_reference_dssr_output["sequence"][best_start_idx:best_end_idx]
+
+    base_pair_indices, _ = \
+        calculate_base_pairs_and_loops_from_secondary_structure(
+            reference_dssr_output["secondary_structure"]
+        )
+    updated_secondary_structure = reference_dssr_output["secondary_structure"]
+    for (i, j) in base_pair_indices:
+        if i < best_start_idx or j < best_start_idx or \
+           i >= best_end_idx or j >= best_end_idx:
+
+            # Turn i and j indices into loops.
+            updated_secondary_structure = \
+                updated_secondary_structure[:i] + \
+                NAConstants.loop_symbols[0] + \
+                updated_secondary_structure[i + 1:]
+            updated_secondary_structure = \
+                updated_secondary_structure[:j] + \
+                NAConstants.loop_symbols[0] + \
+                updated_secondary_structure[j + 1:]
+
+    trimmed_reference_dssr_output["secondary_structure"] = \
+        updated_secondary_structure[best_start_idx:best_end_idx]
+
+    return trimmed_reference_dssr_output
+
 def design_nucleic_acid_sequence(structure_path,
                                  overall_output_directory,
                                  num_samples,
                                  temperature,
                                  method = "na_mpnn",
-                                 na_mpnn_model_path = None):
+                                 na_mpnn_model_path = None,
+                                 with_protein = True):
     """
     Given a structure path, an overall output directory, the number of samples,
     the temperature, and the sequence design method, runs the specified
     sequence design method to generate sequences for the structure. A JSON is
-    created for each design, containing the design ID, name, design sequence,
-    and tool-reported sequence recovery.
+    created for each design, containing the design ID, name, designed nucleic
+    acid sequence data, protein sequences (from native), and metadata.
+
+    Only NA-MPNN supports DNA design and design in protein context.
 
     Args:
         structure_path (str): The path to the structure file.
@@ -2803,23 +4922,27 @@ def design_nucleic_acid_sequence(structure_path,
         num_samples (int): The number of samples to generate.
         temperature (float): The temperature for the sequence design algorithm.
         method (str): The sequence design method to use. Options are "na_mpnn",
-            "grnade", and "rhodesign". Default is "na_mpnn".
+            "grnade", "ridiffusion", and "rhodesign". Default is "na_mpnn".
         na_mpnn_model_path (str): The path to the NA-MPNN model file. Required
             if method is "na_mpnn".
-    
+        with_protein (bool): Whether to include protein chains as structural
+            context during design. If False and the structure contains protein,
+            protein chains are removed before design. Default is True.
+
     Side Effects:
         Creates an output directory for the structure, copies the structure to
             the output directory, creates a subdirectory for the design JSON
-            files, and saves a JSON file for each design containing the design
-            ID, name, design sequence, and tool-reported sequence recovery.
+            files, and saves a JSON file for each design.
     """
     # Convert the structure path and overall output directory to absolute paths.
     structure_path = os.path.abspath(structure_path)
     overall_output_directory = os.path.abspath(overall_output_directory)
 
-    if temperature is None:
+    if method == "ridiffusion":
+        temperature = None
+    elif temperature is None:
         temperature = 0.1
-    
+
     if na_mpnn_model_path is None:
         na_mpnn_model_path = "/home/akubaney/projects/na_mpnn/models/design_model/s_19137.pt"
 
@@ -2862,78 +4985,142 @@ def design_nucleic_acid_sequence(structure_path,
     original_structure_path = structure_path
     structure_path = copy_structure_path
 
+    # Extract normalized sequence information from the native structure.
+    reference_na_sequence_data, reference_protein_sequences = \
+        extract_sequences_from_structure(structure_path)
+    complex_sequence_data = prepare_complex_sequence_data(
+        na_sequence_data = reference_na_sequence_data,
+        protein_sequences = reference_protein_sequences
+    )
+    has_protein = complex_sequence_data["has_protein"]
+    has_dna = complex_sequence_data["has_dna"]
+
+    # Check method compatibility with DNA and protein context.
+    if method != "na_mpnn" and has_dna:
+        raise ValueError(
+            f"Method '{method}' does not support DNA design. "
+            f"Structure '{structure_name}' contains DNA chains."
+        )
+    if method != "na_mpnn" and has_protein and with_protein:
+        raise ValueError(
+            f"Method '{method}' does not support design in protein context."
+        )
+
+    # Rewrite non-canonical NA residues to their canonical equivalents so
+    # downstream design tools can process the structure.
+    canonicalized_structure_path, temp_canonicalized_directory = \
+        canonicalize_noncanonical_na_residues(structure_path)
+
+    # If with_protein is False and the structure has protein, create a
+    # temporary PDB with protein chains removed.
+    temp_na_only_path = None
+    temp_na_only_directory = None
+    design_structure_path = canonicalized_structure_path
+    if not with_protein and has_protein:
+        temp_na_only_path, temp_na_only_directory = \
+            remove_protein_chains_from_structure(
+                canonicalized_structure_path
+            )
+        design_structure_path = temp_na_only_path
+
     # Design JSON output directory.
     design_json_output_directory = os.path.join(output_directory, "design_json")
     os.makedirs(design_json_output_directory)
 
-    if method == "na_mpnn":
-        # Run NA-MPNN sequence design.
-        design_data = run_na_mpnn_sequence(
-            structure_path,
-            output_directory = output_directory,
-            batch_size = num_samples,
-            number_of_batches = 1,
-            temperature = temperature,
-            omit_AA = "ARNDCQEGHILKMFPSTWYVXbdhuy",
-            design_na_only = 1,
-            load_residues_with_missing_atoms = 0,
-            output_pdbs = 0,
-            catch_failed_inferences = 1,
-            na_mpnn_model_path = na_mpnn_model_path
-        )
-    elif method == "grnade":
-        # Run gRNAde sequence design.
-        design_data = run_grnade(
-            structure_path,
-            output_directory = output_directory,
-            n_samples = num_samples,
-            temperature = temperature
-        )
-    elif method == "rhodesign":
-        # Run RhoDesign sequence design.
-        design_data = run_rhodesign(
-            structure_path,
-            output_directory = output_directory,
-            n_samples = num_samples,
-            temperature = temperature
-        )
-    else:
-        raise ValueError(f"Invalid sequence design method: {method}")
+    try:
+        if method == "na_mpnn":
+            # Run NA-MPNN sequence design.
+            design_data = run_na_mpnn_sequence(
+                design_structure_path,
+                output_directory = output_directory,
+                batch_size = num_samples,
+                number_of_batches = 1,
+                temperature = temperature,
+                omit_AA = "ARNDCQEGHILKMFPSTWYVXbdhuy",
+                design_na_only = 1,
+                load_residues_with_missing_atoms = 0,
+                output_pdbs = 0,
+                catch_failed_inferences = 1,
+                na_mpnn_model_path = na_mpnn_model_path
+            )
+        elif method == "grnade":
+            # Run gRNAde sequence design.
+            design_data = run_grnade(
+                design_structure_path,
+                output_directory = output_directory,
+                n_samples = num_samples,
+                temperature = temperature
+            )
+        elif method == "ridiffusion":
+            # Run RIdiffusion sequence design.
+            design_data = run_ridiffusion(
+                design_structure_path,
+                output_directory = output_directory,
+                n_samples = num_samples
+            )
+        elif method == "rhodesign":
+            # Run RhoDesign sequence design.
+            design_data = run_rhodesign(
+                design_structure_path,
+                output_directory = output_directory,
+                n_samples = num_samples,
+                temperature = temperature
+            )
+        else:
+            raise ValueError(f"Invalid sequence design method: {method}")
+    finally:
+        # Clean up the temporary NA-only structure if it was created.
+        if temp_na_only_directory is not None:
+            temp_na_only_directory.cleanup()
+        if temp_canonicalized_directory is not None:
+            temp_canonicalized_directory.cleanup()
 
     # Write the design data to a JSON file.
     for design_dict in design_data:
         design_dict["original_input_structure_path"] = original_structure_path
+        design_dict["input_structure_name"] = structure_name
+        design_dict["input_structure_path"] = structure_path
+        design_dict["name"] = f"{structure_name}_{design_dict['design_id']}"
+        design_dict["na_sequence_data"] = extract_na_sequence_data_from_design_sequence(
+            design_dict["design_sequence"],
+            design_dict["design_method"]
+        )
+        design_dict["protein_sequences"] = reference_protein_sequences
+        design_dict["with_protein"] = with_protein
+
         design_json_path = os.path.join(
             design_json_output_directory,
             f"{design_dict['name']}.json"
         )
-        write_json_file(design_json_path, design_dict)            
+        write_json_file(design_json_path, design_dict)
 
-def process_reference_monomer_rna(reference_structure_path, 
-                                  overall_output_directory):
+def process_reference(reference_structure_path,
+                      overall_output_directory):
     """
     Given a reference structure path and an overall output directory,
-    processes the reference structure, extracts its sequence and secondary
-    structure with DSSR, and saves the results to a JSON file.
+    processes the reference structure by extracting normalized sequence data
+    using AtomWorks, extracting secondary structure with DSSR (for monomer
+    RNA only), and running the AlphaFold3 data pipeline for protein chains
+    (to pre-compute MSAs and templates).
 
     Args:
         reference_structure_path (str): The path to the reference structure.
-        overall_output_directory (str): The path to the overall output 
+        overall_output_directory (str): The path to the overall output
             directory.
-    
+
     Side Effects:
-        Creates an output directory for the reference structure, copies the 
-            reference structure to the output directory, and saves a JSON file 
-            with the results of the predictions.
+        Creates an output directory for the reference structure, copies the
+        reference structure to the output directory, and saves a JSON file
+        with the results of the predictions.
     """
     # Convert the structure path and overall output directory to absolute paths.
     reference_structure_path = os.path.abspath(reference_structure_path)
     overall_output_directory = os.path.abspath(overall_output_directory)
 
-    # Check that the reference structure path.
+    # Check that the reference structure path exists.
     if not os.path.exists(reference_structure_path):
         raise ValueError(f"Reference structure file not found: {reference_structure_path}")
-    
+
     # Create the output directory if it does not exist.
     os.makedirs(overall_output_directory, exist_ok = True)
     
@@ -2973,54 +5160,153 @@ def process_reference_monomer_rna(reference_structure_path,
     reference_json_output_directory = os.path.join(output_directory, "reference_json")
     os.makedirs(reference_json_output_directory)
 
-    # Run dssr.
-    dssr_output = run_dssr(reference_structure_path)
-    
-    # Standardize the dssr sequence.
-    dssr_output["sequence"] = \
-        standardize_rna_sequence(dssr_output["sequence"], 
-                                 method = "dssr")
-    
-    # Check that sequence is valid.
-    check_rna_sequence_validity(dssr_output["sequence"],
-                                unknown_residue_allowed = True,
-                                chain_breaks_allowed = False)
-    
-    # Standardize the dssr secondary structure.
-    dssr_output["secondary_structure"] = \
-        standardize_secondary_structure(dssr_output["secondary_structure"], 
-                                        method = "dssr")
+    # Extract normalized sequence data from the structure.
+    na_sequence_data, protein_sequences = extract_sequences_from_structure(
+        reference_structure_path
+    )
+    complex_sequence_data = prepare_complex_sequence_data(
+        na_sequence_data = na_sequence_data,
+        protein_sequences = protein_sequences
+    )
+    has_protein = complex_sequence_data["has_protein"]
+    is_monomer_rna = complex_sequence_data["is_monomer_rna"]
 
+    # Build the output dictionary.
     output_dict = {
         "name": structure_name,
         "original_reference_structure_path": original_reference_structure_path,
         "reference_structure_path": reference_structure_path,
-        "dssr": dssr_output,
+        "na_sequence_data": na_sequence_data,
+        "protein_sequences": protein_sequences,
     }
 
+    # For monomer RNA, run DSSR to extract sequence and secondary structure.
+    if is_monomer_rna:
+        # Run dssr.
+        dssr_output = run_dssr(reference_structure_path)
+        reference_rna_sequence = na_sequence_data[0][0]
+
+        # Standardize the dssr sequence.
+        dssr_chain_type = na_sequence_data[0][1]
+        dssr_sequence_data = standardize_na_sequence(
+            [(dssr_output["sequence"], dssr_chain_type)],
+            method = "dssr"
+        )
+        dssr_output["sequence"] = dssr_sequence_data[0][0]
+
+        # Check that sequence is valid.
+        check_na_sequence_validity(
+            dssr_sequence_data,
+            unknown_residue_allowed = True
+        )
+
+        # Standardize the dssr secondary structure.
+        dssr_output["secondary_structure"] = \
+            standardize_secondary_structure(
+                dssr_output["secondary_structure"],
+                method = "dssr"
+            )
+
+        if len(dssr_output["sequence"]) != len(reference_rna_sequence):
+            raise ValueError(
+                "Reference DSSR sequence length must match the reference RNA "
+                "sequence length for monomer RNA processing."
+            )
+        if len(dssr_output["secondary_structure"]) != len(reference_rna_sequence):
+            raise ValueError(
+                "Reference DSSR secondary structure length must match the "
+                "reference RNA sequence length for monomer RNA processing."
+            )
+
+        output_dict["dssr"] = dssr_output
+
+    # For structures with protein, run the AlphaFold3 data pipeline for the
+    # full protein complex to pre-compute MSAs and templates.
+    if has_protein:
+        protein_data_pipeline_directory = os.path.abspath(
+            os.path.join(
+                output_directory,
+                "af3_protein_data_pipeline"
+            )
+        )
+        os.makedirs(protein_data_pipeline_directory, exist_ok = True)
+
+        # Use a stable hash of the full protein complex sequence list for the
+        # directory name to avoid filesystem path length issues.
+        protein_complex_hash = stable_sequence_hash(
+            "||".join(protein_sequences)
+        )
+        pipeline_name = f"{structure_name}_{protein_complex_hash}"
+
+        # Run AlphaFold3 data pipeline only (no inference).
+        af3_result = run_alphafold3(
+            name = pipeline_name,
+            chain_sequence_data = [
+                (protein_seq, ChainType.POLYPEPTIDE_L)
+                for protein_seq in protein_sequences
+            ],
+            output_dir = protein_data_pipeline_directory,
+            run_data_pipeline = True,
+            run_inference = False,
+            num_seeds = 1
+        )
+
+        data_json = read_json_file(af3_result["json_input_path"])
+        af3_protein_chain_data = {}
+        for protein_sequence in protein_sequences:
+            found_match = False
+            for sequence_entry in data_json["sequences"]:
+                _sequence_type, seq_data = next(iter(sequence_entry.items()))
+                if seq_data["sequence"] != protein_sequence:
+                    continue
+
+                af3_protein_chain_data[protein_sequence] = {
+                    "unpairedMsa": seq_data["unpairedMsa"],
+                    "pairedMsa": seq_data["pairedMsa"],
+                    "templates": seq_data["templates"]
+                }
+                found_match = True
+                break
+
+            if not found_match:
+                raise ValueError(
+                    "AlphaFold3 protein data pipeline output is missing MSA/"
+                    "template data for a protein sequence in the reference "
+                    "structure."
+                )
+
+        output_dict["af3_protein_chain_data"] = af3_protein_chain_data
+
     # Save the output dictionary to a JSON file.
-    output_json_path = os.path.join(reference_json_output_directory, 
+    output_json_path = os.path.join(reference_json_output_directory,
                                     f"{structure_name}.json")
     write_json_file(output_json_path, output_dict)
 
-def process_design_monomer_rna(subject_path, 
-                               overall_output_directory):
+def process_design(subject_path,
+                   overall_output_directory,
+                   reference_path = None):
     """
     Given a design path and an overall output directory, processes the design
-    by extracting its sequence and secondary structure with DSSR, predicting
-    its secondary structure with EternaFold, predicting its secondary
-    structure and reactivity profile with RiboNanzaNet, and predicting its
-    structure with AlphaFold3. The results are saved to a JSON file.
-    
+    by running appropriate prediction tools based on the complex type:
+      - Monomer RNA without protein: EternaFold, RibonanzaNet, AlphaFold3.
+      - Other NA without protein: AlphaFold3 only.
+      - With protein: AlphaFold3 with pre-computed protein MSAs/templates.
+
+    If the native example contains protein chains, the design is always folded
+    in protein context using the native protein sequences. The with_protein
+    flag only affects the design stage.
+    The results are saved to a JSON file.
+
     Args:
         subject_path (str): The path to the design JSON file.
-        overall_output_directory (str): The path to the overall output 
+        overall_output_directory (str): The path to the overall output
             directory.
-    
+        reference_path (str): The path to the reference output JSON. Required
+            when the structure has protein. Default is None.
+
     Side Effects:
-        Creates an output directory for the design, copies the design fasta 
-            file to the output directory, and saves a JSON file with the 
-            results of the predictions.
+        Creates an output directory for the design and saves a JSON file
+            with the results of the predictions.
     """
     # Convert the subject path and overall output directory to absolute paths.
     subject_path = os.path.abspath(subject_path)
@@ -3028,8 +5314,8 @@ def process_design_monomer_rna(subject_path,
 
     # Check that the subject path exists.
     if not os.path.exists(subject_path):
-        raise ValueError(f"Design fasta file not found: {subject_path}")
-    
+        raise ValueError(f"Design JSON file not found: {subject_path}")
+
     # Create the output directory if it does not exist.
     os.makedirs(overall_output_directory, exist_ok = True)
     
@@ -3050,74 +5336,119 @@ def process_design_monomer_rna(subject_path,
     processed_design_json_output_directory = os.path.join(output_directory, "processed_design_json")
     os.makedirs(processed_design_json_output_directory)
 
-    # Get the design sequence.
-    design_sequence = design_json["design_sequence"]
-    design_method = design_json["design_method"]
-
-    # Standardize the design sequence.
-    design_sequence = standardize_rna_sequence(design_sequence, 
-                                               method = design_method)
-    
-    # Check that sequence is valid.
-    check_rna_sequence_validity(design_sequence,
-                                unknown_residue_allowed = False,
-                                chain_breaks_allowed = False)
-
-    # Predict the secondary structure of the design sequence with EternaFold.
-    eternafold_result = run_eternafold(design_sequence)
-
-    # Predict the secondary structure and reactivity profile of the design
-    # sequence with RiboNanzaNet.
-    ribonanza_net_secondary_structure_result = \
-        run_ribonanza_net_secondary_structure(design_sequence)
-    ribonanza_net_reactivity_profile_result = \
-        run_ribonanza_net_reactivity_profile(design_sequence)
-    
-    # # Predict the structure of the design sequence with AlphaFold3.
-    alphafold3_result = run_alphafold3(
-        name = design_name, 
-        sequences_and_polytypes = [(design_sequence, "rna")], 
-        output_dir = output_directory, 
-        num_diffusion_samples = 5, 
-        num_seeds = 1,
-        run_data_pipeline = False,
-        buckets = "1"
+    # Extract design metadata.
+    na_sequence_data = design_json["na_sequence_data"]
+    protein_sequences = design_json["protein_sequences"]
+    complex_sequence_data = prepare_complex_sequence_data(
+        na_sequence_data = na_sequence_data,
+        protein_sequences = protein_sequences
     )
+    with_protein = design_json["with_protein"]
+    has_protein = complex_sequence_data["has_protein"]
+    is_monomer_rna = complex_sequence_data["is_monomer_rna"]
 
-    # Create the output dictionary.
+    # Build the output dictionary.
     output_dict = {
         "name": design_name,
-        "sequence": design_sequence,
+        "na_sequence_data": na_sequence_data,
+        "protein_sequences": protein_sequences,
+        "with_protein": with_protein,
         "design_input_path": subject_path,
-        "eternafold": eternafold_result,
-        "ribonanza_net_secondary_structure": ribonanza_net_secondary_structure_result,
-        "ribonanza_net_reactivity_profile": ribonanza_net_reactivity_profile_result,
-        "alphafold3": alphafold3_result
     }
 
+    alphafold3_chain_sequence_data = list(na_sequence_data)
+    precomputed_chain_data = None
+
+    # Case A/B: NA-only, no protein.
+    if not has_protein:
+        if is_monomer_rna:
+            # Get the design sequence.
+            design_sequence = na_sequence_data[0][0]
+
+            # Predict the secondary structure of the design sequence with
+            # EternaFold.
+            eternafold_result = run_eternafold(design_sequence)
+            output_dict["eternafold"] = eternafold_result
+
+            # Predict the secondary structure and reactivity profile of the
+            # design sequence with RiboNanzaNet.
+            ribonanza_net_secondary_structure_result = \
+                run_ribonanza_net_secondary_structure(design_sequence)
+            ribonanza_net_reactivity_profile_result = \
+                run_ribonanza_net_reactivity_profile(design_sequence)
+            output_dict["ribonanza_net_secondary_structure"] = \
+                ribonanza_net_secondary_structure_result
+            output_dict["ribonanza_net_reactivity_profile"] = \
+                ribonanza_net_reactivity_profile_result
+
+    # Case C: With protein.
+    else:
+        if reference_path is None:
+            raise ValueError(
+                "reference_path is required when structure has protein."
+            )
+
+        reference_path = os.path.abspath(reference_path)
+        if not os.path.exists(reference_path):
+            raise ValueError(f"Reference JSON file not found: {reference_path}")
+
+        # Load the reference JSON to get pre-computed protein AF3 data.
+        reference_json = read_json_file(reference_path)
+        precomputed_chain_data = reference_json["af3_protein_chain_data"]
+
+        # Build sequences list: NA chains first, then protein chains.
+        for protein_sequence in protein_sequences:
+            alphafold3_chain_sequence_data.append(
+                (protein_sequence, ChainType.POLYPEPTIDE_L)
+            )
+
+    alphafold3_result = run_alphafold3(
+        name = design_name,
+        chain_sequence_data = alphafold3_chain_sequence_data,
+        output_dir = output_directory,
+        num_diffusion_samples = 5,
+        num_seeds = 1,
+        run_data_pipeline = False,
+        precomputed_chain_data = precomputed_chain_data,
+    )
+    output_dict["alphafold3"] = alphafold3_result
+
     # Save the output dictionary to a JSON file.
-    output_json_path = os.path.join(processed_design_json_output_directory, 
+    output_json_path = os.path.join(processed_design_json_output_directory,
                                     f"{design_name}.json")
     write_json_file(output_json_path, output_dict)
 
-def score_design_monomer_rna(reference_path, subject_path, overall_output_directory):
+def score_design(reference_path,
+                 subject_path,
+                 overall_output_directory):
     """
     Given a reference path and a subject path, scores the design by comparing
     the reference and subject sequences, secondary structures, reactivity
-    profiles, and structures.
+    profiles, and/or structures depending on the complex type.
+
+    Scoring modes:
+      - Monomer RNA without protein: sequence recovery, GC content, secondary
+        structure F1 scores, reactivity profile scores, C1' RMSD/lDDT/gDDT,
+        AF3 confidence metrics.
+      - Other NA without protein: sequence recovery, GC content, C1'
+        RMSD/lDDT/gDDT, AF3 confidence metrics.
+      - With protein: sequence recovery, GC content, protein-aligned NA C1'
+        RMSD, iPTM, MinPAE, AF3 confidence metrics.
 
     Args:
-        reference_path (str): The path to the reference output json.
+        reference_path (str): The path to the reference output JSON.
         subject_path (str): The path to the subject output json.
-        overall_output_directory (str): The path to the overall output 
+        overall_output_directory (str): The path to the overall output
             directory.
-    
+
     Side Effects:
         Creates an output directory for the subject and saves a JSON file
             with the results of the scoring.
     """
-    import biotite
-    import biotite.structure.io
+    if reference_path is None:
+        raise ValueError(
+            "reference_path is required for score_design."
+        )
 
     # Convert the reference path and subject path to absolute paths.
     reference_path = os.path.abspath(reference_path)
@@ -3125,11 +5456,11 @@ def score_design_monomer_rna(reference_path, subject_path, overall_output_direct
 
     # Check that the reference path exists.
     if not os.path.exists(reference_path):
-        raise ValueError(f"Reference structure file not found: {reference_path}")
-    
+        raise ValueError(f"Reference file not found: {reference_path}")
+
     # Check that the subject path exists.
     if not os.path.exists(subject_path):
-        raise ValueError(f"Subject structure file not found: {subject_path}")
+        raise ValueError(f"Subject file not found: {subject_path}")
     
     # Create the output directory if it does not exist.
     os.makedirs(overall_output_directory, exist_ok = True)
@@ -3148,167 +5479,70 @@ def score_design_monomer_rna(reference_path, subject_path, overall_output_direct
         shutil.rmtree(output_directory)
     os.makedirs(output_directory)
 
-    # Load the C1' atoms from the reference and subject structures.
-    subject_atom_array = biotite.structure.io.load_structure(subject_output["alphafold3"]["predicted_structure_path"])
-    reference_atom_array = biotite.structure.io.load_structure(reference_output["reference_structure_path"])
+    # Determine the complex type.
+    reference_na_sequence_data = reference_output["na_sequence_data"]
+    reference_protein_sequences = reference_output["protein_sequences"]
+    subject_na_sequence_data = subject_output["na_sequence_data"]
+    subject_protein_sequences = subject_output["protein_sequences"]
     
-    reference_atom_array = reference_atom_array[reference_atom_array.atom_name == "C1'"]
-    subject_atom_array = subject_atom_array[subject_atom_array.atom_name == "C1'"]
+    reference_complex_sequence_data = prepare_complex_sequence_data(
+        na_sequence_data = reference_na_sequence_data,
+        protein_sequences = reference_protein_sequences
+    )
+    subject_complex_sequence_data = prepare_complex_sequence_data(
+        na_sequence_data = subject_na_sequence_data,
+        protein_sequences = subject_protein_sequences
+    )
 
-    # Handle the case where the subject sequence is shorter than the reference
-    # sequence. This can happen if residues at the end get chopped off.
-    subject_sequence_length = len(subject_output["sequence"])
-    reference_sequence_length = len(reference_output["dssr"]["sequence"])
-    if subject_sequence_length == reference_sequence_length:
-        best_start_idx = None
-        best_end_idx = None
-    elif subject_sequence_length < reference_sequence_length:
-        # Perform an rmsd calculation to determine the best overlap.
-        best_rmsd = None
-        best_start_idx = None
-        for possible_start_idx in range(reference_sequence_length - subject_sequence_length + 1):
-            reference_start_idx = possible_start_idx
-            reference_end_idx = reference_start_idx + subject_sequence_length
-
-            # Subset the reference atom array.
-            reference_atom_subarray = reference_atom_array[
-                reference_start_idx:reference_end_idx
-            ]
-
-            # Superimpose the reference and subject atom arrays.
-            superimposed, _ = biotite.structure.superimpose(
-                reference_atom_subarray,
-                subject_atom_array
-            )
-
-            # Calculate the RMSD.
-            c1_prime_rmsd = biotite.structure.rmsd(
-                reference_atom_subarray,
-                superimposed
-            )
-
-            if best_rmsd is None or c1_prime_rmsd < best_rmsd:
-                best_rmsd = c1_prime_rmsd
-                best_start_idx = possible_start_idx
-        
-        best_end_idx = best_start_idx + subject_sequence_length
-
-        # Subset the sequence, and atom array to the best overlap.
-        reference_output["dssr"]["sequence"] = \
-            reference_output["dssr"]["sequence"][best_start_idx:best_end_idx]
-        reference_atom_array = reference_atom_array[best_start_idx:best_end_idx]
-
-        # The secondary structure needs to be modified in an appropriate way
-        # (any base pairs to the removed residues need to be removed).
-        base_pair_indices, _ = calculate_base_pairs_and_loops_from_secondary_structure(
-            reference_output["dssr"]["secondary_structure"]
+    with_protein = subject_output["with_protein"]
+    reference_has_protein = reference_complex_sequence_data["has_protein"]
+    subject_has_protein = subject_complex_sequence_data["has_protein"]
+    reference_is_single_rna_chain = reference_complex_sequence_data[
+        "is_single_rna_chain"
+    ]
+    subject_is_single_rna_chain = subject_complex_sequence_data[
+        "is_single_rna_chain"
+    ]
+    if reference_has_protein != subject_has_protein:
+        raise ValueError(
+            "Reference and subject must agree on whether protein chains are "
+            "present."
         )
-        updated_secondary_structure = reference_output["dssr"]["secondary_structure"]
-        for (i, j) in base_pair_indices:
-            if i < best_start_idx or j < best_start_idx or \
-               i >= best_end_idx or j >= best_end_idx:
-                
-                # Turn i and j indices into loops.
-                updated_secondary_structure = \
-                    updated_secondary_structure[:i] + \
-                    NAConstants.loop_symbols[0] + \
-                    updated_secondary_structure[i + 1:]
-                updated_secondary_structure = \
-                    updated_secondary_structure[:j] + \
-                    NAConstants.loop_symbols[0] + \
-                    updated_secondary_structure[j + 1:]
-        
-        # Now trim the updated secondary structure.
-        reference_output["dssr"]["secondary_structure"] = \
-            updated_secondary_structure[best_start_idx:best_end_idx]
-    else:
-        raise ValueError("Subject sequence is longer than reference sequence.")
-    
-    # Compare the sequences.
-    sequence_recovery_result = calculate_sequence_recovery(
-        reference_output["dssr"]["sequence"],
-        subject_output["sequence"]
-    )
-
-    # Compare the reference secondary structure to the eternafold predicted
-    # secondary structure.
-    eternafold_secondary_structure_result = \
-        calculate_secondary_structure_stats(
-            reference_output["dssr"]["secondary_structure"],
-            subject_output["eternafold"]["predicted_secondary_structure"]
+    if reference_is_single_rna_chain != subject_is_single_rna_chain:
+        raise ValueError(
+            "Reference and subject must agree on whether they are single "
+            "RNA-chain complexes."
         )
-    
-    # Compare the reference secondary structure to the ribonanza net
-    # predicted secondary structures.
-    ribonanza_net_secondary_structure_result = dict()
-    for predicted_secondary_structure in subject_output["ribonanza_net_secondary_structure"]["predicted_secondary_structures"]:
-        individual_result = \
-            calculate_secondary_structure_stats(
-                reference_output["dssr"]["secondary_structure"],
-                predicted_secondary_structure
-            )
-        
-        # Append the results for each ribonanza net predicted secondary
-        # structure to the ribonanza net secondary structure result.
-        for metric_name, metric_value in individual_result.items():
-            if metric_name not in ribonanza_net_secondary_structure_result:
-                ribonanza_net_secondary_structure_result[metric_name] = []
-            ribonanza_net_secondary_structure_result[metric_name].append(metric_value)
-    
-    # Calculate the mean of the ribonanza net secondary structure results.
-    for metric_name, metric_values in list(ribonanza_net_secondary_structure_result.items()):
-        ribonanza_net_secondary_structure_result[f"mean_{metric_name}"] = \
-            np.mean(metric_values)
-        
-    # Compare the reference secondary structure to the ribonanza net
-    # predicted reactivity profiles.
-    ribonanza_net_reactivity_profile_result = dict()
-    for predicted_reactivity_profile in subject_output["ribonanza_net_reactivity_profile"]["predicted_2A3_reactivity_profiles"]:
-        individual_result = \
-            calculate_reactivity_profile_score(
-                reference_output["dssr"]["secondary_structure"],
-                predicted_reactivity_profile
-            )
-        
-        # Append the results for each ribonanza net predicted reactivity
-        # profile to the ribonanza net reactivity profile result.
-        for metric_name, metric_value in individual_result.items():
-            if metric_name not in ribonanza_net_reactivity_profile_result:
-                ribonanza_net_reactivity_profile_result[metric_name] = []
-            ribonanza_net_reactivity_profile_result[metric_name].append(metric_value)
-        
-    # Calculate the mean of the ribonanza net reactivity profile results.
-    for metric_name, metric_values in list(ribonanza_net_reactivity_profile_result.items()):
-        ribonanza_net_reactivity_profile_result[f"mean_{metric_name}"] = \
-            np.mean(metric_values)
 
-    # Check that the reference and subject structures contain the same number
-    # of C1' atoms.
-    if reference_atom_array.shape[0] != subject_atom_array.shape[0]:
-        raise ValueError("Reference and subject structures must contain the same number of C1' atoms.")
-    
-    superimposed, _ = biotite.structure.superimpose(
-        reference_atom_array,
-        subject_atom_array
-    )
-    c1_prime_rmsd = biotite.structure.rmsd(
-        reference_atom_array,
-        superimposed
-    )
+    has_protein = reference_has_protein
+    is_single_rna_chain = reference_is_single_rna_chain
+    is_monomer_rna = is_single_rna_chain and not has_protein
+    if has_protein and reference_protein_sequences != subject_protein_sequences:
+        raise ValueError(
+            "Reference and subject protein sequences must match for "
+            "protein-context scoring."
+        )
 
-    c1_prime_lddt = biotite.structure.lddt(
-        reference_atom_array,
-        subject_atom_array
-    )
+    # GC content.
+    subject_gc = calculate_gc_content(subject_na_sequence_data)
+    reference_gc = calculate_gc_content(reference_na_sequence_data)
+    delta_gc = subject_gc - reference_gc
 
-    c1_prime_gddt = biotite.structure.lddt(
-        reference_atom_array,
-        subject_atom_array,
-        inclusion_radius = 10000,
-        distance_bins = (1.0, 2.0, 4.0, 8.0)
+    reference_sequence_length = sum(
+        len(sequence) for sequence, _ in reference_na_sequence_data
     )
+    subject_sequence_length = sum(
+        len(sequence) for sequence, _ in subject_na_sequence_data
+    )
+    if subject_sequence_length != reference_sequence_length:
+        raise ValueError(
+            "Subject and reference nucleic acid sequence lengths must match "
+            "for design scoring. "
+            f"Subject length: {subject_sequence_length}; "
+            f"reference length: {reference_sequence_length}."
+        )
 
-    # Create the output dictionary.
+    # Start building the output dictionary.
     output_dict = {
         "reference_name": reference_output["name"],
         "reference_path": reference_path,
@@ -3316,26 +5550,179 @@ def score_design_monomer_rna(reference_path, subject_path, overall_output_direct
         "subject_name": subject_output["name"],
         "subject_path": subject_path,
         "subject_sequence_length": subject_sequence_length,
-        "best_start_idx": best_start_idx,
-        "best_end_idx": best_end_idx,
-        "sequence_recovery": sequence_recovery_result["sequence_recovery"],
-        "eternafold_f1_score_pairs": eternafold_secondary_structure_result["f1_score_pairs"],
-        "eternafold_f1_score_loops": eternafold_secondary_structure_result["f1_score_loops"],
-        "ribonanza_net_f1_score_pairs": ribonanza_net_secondary_structure_result["mean_f1_score_pairs"],
-        "ribonanza_net_f1_score_loops": ribonanza_net_secondary_structure_result["mean_f1_score_loops"],
-        "ribonanza_net_eternafold_class_score": ribonanza_net_reactivity_profile_result["mean_eternafold_class_score"],
-        "ribonanza_net_crossed_pair_quality_score": ribonanza_net_reactivity_profile_result["mean_crossed_pair_quality_score"],
-        "ribonanza_net_openknot_score": ribonanza_net_reactivity_profile_result["mean_openknot_score"],
-        "alphafold3_c1_prime_rmsd": float(c1_prime_rmsd),
-        "alphafold3_c1_prime_lddt": c1_prime_lddt,
-        "alphafold3_c1_prime_gddt": c1_prime_gddt,
+        "with_protein": with_protein,
+        "gc_content": subject_gc,
+        "reference_gc_content": reference_gc,
+        "delta_gc_content": delta_gc,
         "alphafold3_ptm": subject_output["alphafold3"]["ptm"],
+        "alphafold3_iptm": subject_output["alphafold3"]["iptm"],
+        "alphafold3_plddt": subject_output["alphafold3"]["plddt"],
         "alphafold3_pae": subject_output["alphafold3"]["pae"],
-        "alphafold3_plddt": subject_output["alphafold3"]["plddt"]
+        "alphafold3_chain_pair_pae_min": subject_output["alphafold3"][
+            "chain_pair_pae_min"
+        ],
+        "alphafold3_min_cross_chain_pae": subject_output["alphafold3"][
+            "min_cross_chain_pae"
+        ],
     }
 
+    # Load the full atom arrays once for downstream structural metrics.
+    subject_atom_array = load_first_assembly_atom_array(
+        subject_output["alphafold3"]["predicted_structure_path"],
+        add_missing_atoms = False
+    )
+    reference_atom_array = load_first_assembly_atom_array(
+        reference_output["reference_structure_path"],
+        add_missing_atoms = False
+    )
+
+    # With-protein scoring is always used for native protein-containing
+    # examples, even if the sequence design itself was run without protein
+    # context.
+    if has_protein:
+        protein_aligned_na_c1_prime_rmsd = calculate_protein_aligned_na_c1_rmsd(
+            reference_atom_array,
+            subject_atom_array
+        )
+        output_dict["alphafold3_protein_aligned_na_c1_prime_rmsd"] = \
+            protein_aligned_na_c1_prime_rmsd
+
+    else:
+        # Secondary structure and reactivity metrics (monomer RNA only).
+        if is_monomer_rna:
+            reference_dssr_output = dict(reference_output["dssr"])
+
+            # Compare the reference secondary structure to the eternafold
+            # predicted secondary structure.
+            eternafold_secondary_structure_result = \
+                calculate_secondary_structure_stats(
+                    reference_dssr_output["secondary_structure"],
+                    subject_output["eternafold"]["predicted_secondary_structure"]
+                )
+            output_dict["eternafold_f1_score_pairs"] = \
+                eternafold_secondary_structure_result["f1_score_pairs"]
+            output_dict["eternafold_f1_score_loops"] = \
+                eternafold_secondary_structure_result["f1_score_loops"]
+
+            # Compare the reference secondary structure to the ribonanza net
+            # predicted secondary structures.
+            ribonanza_net_secondary_structure_result = dict()
+            for predicted_secondary_structure in subject_output[
+                "ribonanza_net_secondary_structure"
+            ]["predicted_secondary_structures"]:
+                predicted_secondary_structure = standardize_secondary_structure(
+                    predicted_secondary_structure,
+                    method = "ribonanzanet"
+                )
+                individual_result = calculate_secondary_structure_stats(
+                    reference_dssr_output["secondary_structure"],
+                    predicted_secondary_structure
+                )
+
+                # Append the results for each ribonanza net predicted
+                # secondary structure to the ribonanza net secondary
+                # structure result.
+                for metric_name, metric_value in individual_result.items():
+                    if metric_name not in \
+                       ribonanza_net_secondary_structure_result:
+                        ribonanza_net_secondary_structure_result[
+                            metric_name
+                        ] = []
+                    ribonanza_net_secondary_structure_result[
+                        metric_name
+                    ].append(metric_value)
+
+            # Calculate the mean of the ribonanza net secondary structure
+            # results.
+            for metric_name, metric_values in list(
+                ribonanza_net_secondary_structure_result.items()
+            ):
+                ribonanza_net_secondary_structure_result[
+                    f"mean_{metric_name}"
+                ] = np.mean(metric_values)
+
+            output_dict["ribonanza_net_f1_score_pairs"] = \
+                ribonanza_net_secondary_structure_result[
+                    "mean_f1_score_pairs"
+                ]
+            output_dict["ribonanza_net_f1_score_loops"] = \
+                ribonanza_net_secondary_structure_result[
+                    "mean_f1_score_loops"
+                ]
+
+            # Compare the reference secondary structure to the ribonanza net
+            # predicted reactivity profiles.
+            ribonanza_net_reactivity_profile_result = dict()
+            for predicted_reactivity_profile in subject_output[
+                "ribonanza_net_reactivity_profile"
+            ]["predicted_2A3_reactivity_profiles"]:
+                individual_result = calculate_reactivity_profile_score(
+                    reference_dssr_output["secondary_structure"],
+                    predicted_reactivity_profile
+                )
+
+                # Append the results for each ribonanza net predicted
+                # reactivity profile to the ribonanza net reactivity profile
+                # result.
+                for metric_name, metric_value in individual_result.items():
+                    if metric_name not in \
+                       ribonanza_net_reactivity_profile_result:
+                        ribonanza_net_reactivity_profile_result[
+                            metric_name
+                        ] = []
+                    ribonanza_net_reactivity_profile_result[
+                        metric_name
+                    ].append(metric_value)
+
+            # Calculate the mean of the ribonanza net reactivity profile
+            # results.
+            for metric_name, metric_values in list(
+                ribonanza_net_reactivity_profile_result.items()
+            ):
+                ribonanza_net_reactivity_profile_result[
+                    f"mean_{metric_name}"
+                ] = np.mean(metric_values)
+
+            output_dict["ribonanza_net_eternafold_class_score"] = \
+                ribonanza_net_reactivity_profile_result[
+                    "mean_eternafold_class_score"
+                ]
+            output_dict["ribonanza_net_crossed_pair_quality_score"] = \
+                ribonanza_net_reactivity_profile_result[
+                    "mean_crossed_pair_quality_score"
+                ]
+            output_dict["ribonanza_net_openknot_score"] = \
+                ribonanza_net_reactivity_profile_result[
+                    "mean_openknot_score"
+                ]
+
+        c1_prime_rmsd = calculate_na_c1_rmsd(
+            reference_atom_array,
+            subject_atom_array
+        )
+        c1_prime_lddt_gddt_result = calculate_na_c1_lddt_gddt(
+            reference_atom_array,
+            subject_atom_array
+        )
+
+        output_dict["alphafold3_c1_prime_rmsd"] = float(c1_prime_rmsd)
+        output_dict["alphafold3_c1_prime_lddt"] = \
+            c1_prime_lddt_gddt_result["c1_prime_lddt"]
+        output_dict["alphafold3_c1_prime_gddt"] = \
+            c1_prime_lddt_gddt_result["c1_prime_gddt"]
+
+    # Compare the reference and subject nucleic acid sequences.
+    sequence_recovery_result = calculate_sequence_recovery(
+        reference_na_sequence_data,
+        subject_na_sequence_data,
+        unknown_residue_allowed_in_reference = True
+    )
+    output_dict["sequence_recovery"] = sequence_recovery_result[
+        "sequence_recovery"
+    ]
+
     # Save the output dictionary to a JSON file.
-    output_json_path = os.path.join(output_directory, 
+    output_json_path = os.path.join(output_directory,
                                     f"{subject_output['name']}.json")
     write_json_file(output_json_path, output_dict)
 
@@ -3362,7 +5749,8 @@ def predict_nucleic_acid_ppm(structure_path,
         ppm_polymer_type (str): The polymer type for the specificity prediction.
             Options are "dna" and "rna". Default is "dna".
         method (str): The specificity prediction method to use. Options are
-            "na_mpnn" and "deeppbs". Default is "na_mpnn".
+            "na_mpnn", "deeppbs", "rclamps_zf", and "rclamps_homeodomain".
+            Default is "na_mpnn".
         na_mpnn_model_path (str): The path to the NA-MPNN model file. Required
             if method is "na_mpnn".
     
@@ -3450,6 +5838,20 @@ def predict_nucleic_acid_ppm(structure_path,
         specificity_data = run_deeppbs(
             structure_path,
             output_directory = output_directory
+        )
+    elif method in ("rclamps_zf", "rclamps_homeodomain"):
+        if method == "rclamps_zf":
+            domain_type = "zf-C2H2"
+        elif method == "rclamps_homeodomain":
+            domain_type = "homeodomain"
+        else:
+            raise ValueError(f"Invalid rCLAMPS domain type: {method}")
+        
+        # Run rCLAMPS specificity prediction.
+        specificity_data = run_rclamps(
+            structure_path,
+            output_directory = output_directory,
+            domain_type = domain_type
         )
     else:
         raise ValueError(f"Invalid specificity prediction method: {method}")
@@ -3640,10 +6042,13 @@ def score_specificity_prediction(reference_ppms_list_str,
         "cross_entropy_rna": cross_entropy_rna,
     }
 
-    # Convert numpy arrays to lists for JSON serialization.
+    # Convert numpy arrays to lists and numpy scalars to Python int/float for
+    # JSON serialization.
     for k, v in result.items():
         if isinstance(v, np.ndarray):
             result[k] = v.tolist()
+        elif isinstance(v, np.generic):
+            result[k] = v.item()
     
     # Save the result to a JSON file.
     output_json_path = os.path.join(output_directory,
@@ -3713,9 +6118,15 @@ if __name__ == "__main__":
         help = "The path to the reference data."
     )
     argument_parser.add_argument(
-        "--reference_ppms_list_str", 
+        "--reference_ppms_list_str",
         type = str,
         help = "The reference PPM list string."
+    )
+    argument_parser.add_argument(
+        "--with_protein",
+        type = int,
+        help = "Whether to include protein context during design (0 or 1).",
+        default = 1
     )
 
     # Parse the command line arguments.
@@ -3727,17 +6138,21 @@ if __name__ == "__main__":
                                      args.num_samples,
                                      args.temperature,
                                      method = args.method,
-                                     na_mpnn_model_path = args.na_mpnn_model_path)
-    elif args.function_name == "process_reference_monomer_rna":
-        process_reference_monomer_rna(args.reference_structure_path,
-                                      args.overall_output_directory)
-    elif args.function_name == "process_design_monomer_rna":
-        process_design_monomer_rna(args.subject_path,
-                                   args.overall_output_directory)
-    elif args.function_name == "score_design_monomer_rna":
-        score_design_monomer_rna(args.reference_path,
-                                 args.subject_path,
-                                 args.overall_output_directory)
+                                     na_mpnn_model_path = args.na_mpnn_model_path,
+                                     with_protein = bool(args.with_protein))
+    elif args.function_name == "process_reference":
+        process_reference(
+            args.reference_structure_path,
+            args.overall_output_directory
+        )
+    elif args.function_name == "process_design":
+        process_design(args.subject_path,
+                       args.overall_output_directory,
+                       reference_path = args.reference_path)
+    elif args.function_name == "score_design":
+        score_design(args.reference_path,
+                     args.subject_path,
+                     args.overall_output_directory)
     elif args.function_name == "predict_nucleic_acid_ppm":
         predict_nucleic_acid_ppm(args.structure_path,
                                  args.overall_output_directory,

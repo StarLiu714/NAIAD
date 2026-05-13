@@ -7,6 +7,8 @@
 #SBATCH --error=logs/%A_%a.err
 #SBATCH --job-name=score_designs
 
+source /home/akubaney/projects/na_mpnn/.venv/bin/activate
+
 PROCESSED_DIR=$1
 PROCESSED_REF_DIR=$2
 OUTPUT_DIR=$3
@@ -23,10 +25,6 @@ fi
 if [[ ! -d "$OUTPUT_DIR" ]]; then
     echo "Score output directory '$OUTPUT_DIR' not found; creating it..."
     mkdir -p "$OUTPUT_DIR"
-fi
-if ! command -v apptainer &>/dev/null; then
-    echo "Error: apptainer required but not on PATH." >&2
-    exit 1
 fi
 
 # 2) Collect all JSON files under the processed-designs directory
@@ -48,22 +46,23 @@ END_IDX=$(( START_IDX + CHUNK_SIZE - 1 ))
 
 # 4) Process the assigned slice of JSON files
 for idx in $(seq "$START_IDX" "$END_IDX"); do
+    if (( idx >= total_json )); then
+        break
+    fi
     json_path=${json_files[idx]}
     filename=$(basename "$json_path" .json)
-    pdb_id="${filename%_*}"
+    input_structure_name="${filename%_*}"
 
-    ref_json="$PROCESSED_REF_DIR/$pdb_id/reference_json/$pdb_id.json"
+    ref_json="$PROCESSED_REF_DIR/$input_structure_name/reference_json/$input_structure_name.json"
 
     if [[ ! -f "$ref_json" ]]; then
-        echo "Reference JSON not found for $pdb_id: '$ref_json'. Skipping." >&2
+        echo "Reference JSON not found for $input_structure_name: '$ref_json'. Skipping." >&2
         continue
     fi
 
-    apptainer exec \
-        /software/containers/users/ncorley/modelhub/frozen_modelhub_datahub_cifutils_2025-02-06.sif \
-        python /home/akubaney/projects/na_mpnn/evaluation/na_eval_utils.py \
-            --function_name score_design_monomer_rna \
-            --reference_path "$ref_json" \
-            --subject_path "$json_path" \
-            --overall_output_directory "$OUTPUT_DIR"
+    python /home/akubaney/projects/na_mpnn/evaluation/na_eval_utils.py \
+        --function_name score_design \
+        --reference_path "$ref_json" \
+        --subject_path "$json_path" \
+        --overall_output_directory "$OUTPUT_DIR"
 done

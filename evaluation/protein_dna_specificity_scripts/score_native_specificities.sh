@@ -8,6 +8,8 @@
 #SBATCH --job-name=score_native_specificities
 #SBATCH --time=00:10:00
 
+source /home/akubaney/projects/na_mpnn/.venv/bin/activate
+
 CSV_FILE=$1
 SPECIFIED_DIRECTORY=$2
 OUTPUT_DIR=$3
