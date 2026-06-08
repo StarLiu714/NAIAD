@@ -1,4 +1,5 @@
 from openbabel import openbabel
+import os
 import numpy as np
 import networkx as nx
 import torch
@@ -265,8 +266,12 @@ class OBMolFeaturizer:
             ('7s',2), ('5f',14), ('6d',10), ('7p',6)
         ]
         self.econf = {}
-        # TODO: make path relative
-        for l in open('/home/aivan/git/chemnet/arch.22-10-28/data/elements.txt','r').readlines():
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        elements_path = os.environ.get(
+            'NAIAD_ELEMENTS_PATH',
+            os.path.join(repo_root, 'data', 'datasets', 'rcsb_cif', 'elements.txt')
+        )
+        for l in open(elements_path, 'r').readlines():
             num,element,shell_str = l.strip().split('\t')
             shell = {s[:2]:int(s[2:]) for s in shell_str.split()}
             shell = [[1]*shell[k]+[0]*(v-shell[k]) if k in shell.keys() else [0]*v for k,v in spdf]

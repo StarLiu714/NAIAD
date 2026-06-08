@@ -10,11 +10,29 @@ import yaml
 import numpy as np
 import torch
 
-sys.path.append("/projects/ml/afavor/ribonanzanet/kaggle/input/RibonanzaNet2D_Final")
+RIBONANZA_NET_ROOT = os.environ.get("RIBONANZA_NET_ROOT", "external/ribonanzanet")
+RIBONANZA_NET_2D_PATH = os.environ.get(
+    "RIBONANZA_NET_2D_PATH",
+    os.path.join(RIBONANZA_NET_ROOT, "kaggle", "input", "RibonanzaNet2D_Final")
+)
+RIBONANZA_NET_CONFIG_PATH = os.environ.get(
+    "RIBONANZA_NET_CONFIG_PATH",
+    os.path.join(RIBONANZA_NET_2D_PATH, "configs", "pairwise.yaml")
+)
+RIBONANZA_NET_REACTIVITY_WEIGHTS = os.environ.get(
+    "RIBONANZA_NET_REACTIVITY_WEIGHTS",
+    os.path.join(RIBONANZA_NET_ROOT, "kaggle", "input", "RibonanzaNet_Weights", "RibonanzaNet.pt")
+)
+RIBONANZA_NET_SS_WEIGHTS = os.environ.get(
+    "RIBONANZA_NET_SS_WEIGHTS",
+    os.path.join(RIBONANZA_NET_ROOT, "kaggle", "input", "RibonanzaNet_Weights", "RibonanzaNet-SS.pt")
+)
+
+sys.path.append(RIBONANZA_NET_2D_PATH)
 from Network import RibonanzaNet
 
 # Setup ARNIE.
-sys.path.append("/projects/ml/afavor/ribonanzanet/")
+sys.path.append(RIBONANZA_NET_ROOT)
 with tempfile.NamedTemporaryFile(mode = "wt", suffix = ".txt") as f:
     # Setup the ARNIE config file.
     f.write("linearpartition: . \nTMP: /tmp")
@@ -203,13 +221,13 @@ if __name__ == "__main__":
     output_directory = sys.argv[3]
     batch_size = int(sys.argv[4])
 
-    config_path = "/projects/ml/afavor/ribonanzanet/kaggle/input/RibonanzaNet2D_Final/configs/pairwise.yaml"
+    config_path = RIBONANZA_NET_CONFIG_PATH
     if mode == "reactivity_profile":
         model_class = RibonanzaNet
-        weights_path = "/projects/ml/afavor/ribonanzanet/kaggle/input/RibonanzaNet_Weights/RibonanzaNet.pt"
+        weights_path = RIBONANZA_NET_REACTIVITY_WEIGHTS
     elif mode == "secondary_structure":
         model_class = finetuned_RibonanzaNet
-        weights_path = "/projects/ml/afavor/ribonanzanet/kaggle/input/RibonanzaNet_Weights/RibonanzaNet-SS.pt"
+        weights_path = RIBONANZA_NET_SS_WEIGHTS
     else:
         raise ValueError(f"Invalid mode: {mode}")
 

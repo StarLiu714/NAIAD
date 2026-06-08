@@ -1,0 +1,3 @@
+[submodule "pdbx"]
+	path = pdbx
+	url = https://github.com/soedinglab/pdbx.git

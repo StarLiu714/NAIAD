@@ -1,0 +1,4 @@
+splits/*.json binary linguist-generated=true
+splits/*.csv binary linguist-generated=true
+splits/**/*.json binary linguist-generated=true
+splits/**/*.csv binary linguist-generated=true

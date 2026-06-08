@@ -3,8 +3,18 @@
 
 import collections
 import itertools
+import sys
+import types
 
 import numpy as np
+
+if not hasattr(np, "alltrue"):
+    np.alltrue = np.all
+if "numpy.lib.arraysetops" not in sys.modules:
+    arraysetops = types.ModuleType("numpy.lib.arraysetops")
+    arraysetops.isin = np.isin
+    sys.modules["numpy.lib.arraysetops"] = arraysetops
+
 import prody
 prody.confProDy(verbosity='none')
 
@@ -164,8 +174,12 @@ class PDBParser(object):
         atoms_by_chain = dict(atoms_by_chain)
 
         chains = dict()
+        polymer_restypes = set(self.protein_restypes + self.dna_restypes + self.rna_restypes)
         for chain_letter in atoms_by_chain:
             chain_atoms = atoms_by_chain[chain_letter]
+            chain_atoms = [a for a in chain_atoms if a.name[2] in polymer_restypes]
+            if not chain_atoms:
+                continue
 
             unique_residues = list(set([a.name[2] for a in chain_atoms]))
 

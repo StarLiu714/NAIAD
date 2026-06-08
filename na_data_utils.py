@@ -5,6 +5,173 @@ import itertools
 import copy
 import ast
 
+
+def convert_sample_to_tensors(out_dict):
+    """
+    Convert a single sample's numpy arrays to PyTorch tensors.
+    This is called in worker processes to enable parallel tensor creation.
+    
+    Args:
+        out_dict: Dictionary containing numpy arrays from the loader
+        
+    Returns:
+        Dictionary with numpy arrays converted to tensors
+    """
+    if out_dict == "pass":
+        return out_dict
+    
+    # Keys that should be converted to tensors
+    tensor_keys = [
+        "X", "X_m", "S", "R_idx", "chain_labels",
+        "protein_mask", "dna_mask", "rna_mask", "R_polymer_type",
+        "interface_mask", "base_pair_mask", "base_pair_index",
+        "canonical_base_pair_mask", "canonical_base_pair_index",
+        "aligned_ppm", "ppm_mask"
+    ]
+    
+    for key in tensor_keys:
+        if key in out_dict and isinstance(out_dict[key], np.ndarray):
+            out_dict[key] = torch.from_numpy(out_dict[key])
+    
+    return out_dict
+
+
+def collate_fn_optimized(batch, polytype_to_int, restype_to_int, atom_dict):
+    """
+    Custom collate function that handles batch collation in worker processes.
+    This moves the heavy tensor creation work from main thread to workers.
+    
+    Args:
+        batch: List of samples from __getitem__
+        polytype_to_int: Dict mapping polymer types to integers
+        restype_to_int: Dict mapping residue types to integers
+        atom_dict: Dict mapping atom names to indices
+        
+    Returns:
+        Dictionary of batched tensors (still on CPU, will be moved to GPU in training loop)
+    """
+    # Flatten the batch structure
+    # batch is [[[(out_dict, L), ...], ...]]
+    valid_items = []
+    for item in batch:
+        if isinstance(item, list):
+            for sub_item in item:
+                if isinstance(sub_item, tuple) and len(sub_item) == 2:
+                    out_dict, L = sub_item
+                    if isinstance(out_dict, dict) and isinstance(L, (int, torch.Tensor)):
+                        valid_items.append((out_dict, L))
+    
+    if len(valid_items) == 0:
+        return None
+    
+    B = len(valid_items)
+    
+    # Get max length
+    L_list = []
+    for out_dict, L in valid_items:
+        if isinstance(L, int):
+            L = torch.tensor(L)
+        L_list.append(L)
+    L_stack = torch.stack(L_list)
+    L_max = torch.max(L_stack).item()
+    if L_max == 0:
+        return None  # Skip degenerate batch with empty sequences
+    
+    # Pre-allocate tensors
+    X = torch.zeros([B, L_max, len(atom_dict), 3], dtype=torch.float32)
+    X_m = torch.zeros([B, L_max, len(atom_dict)], dtype=torch.int32)
+    mask = torch.zeros([B, L_max], dtype=torch.int32)
+    S = restype_to_int["PAD"] * torch.ones([B, L_max], dtype=torch.int64)
+    R_idx = -100 * torch.ones([B, L_max], dtype=torch.int32)
+    chain_labels = -1 * torch.ones([B, L_max], dtype=torch.int64)
+    
+    protein_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    dna_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    rna_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    
+    R_polymer_type = polytype_to_int["PAD"] * torch.ones([B, L_max], dtype=torch.int64)
+    
+    interface_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    base_pair_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    base_pair_index = torch.zeros([B, L_max], dtype=torch.int64)
+    canonical_base_pair_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    canonical_base_pair_index = torch.zeros([B, L_max], dtype=torch.int64)
+    
+    aligned_ppm = torch.zeros([B, L_max, len(restype_to_int)], dtype=torch.float64)
+    ppm_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    
+    structure_paths = []
+    assembly_ids = []
+    
+    # Fill tensors
+    for i, (out_dict, _) in enumerate(valid_items):
+        L_i = L_stack[i].item()
+        
+        # Handle both tensor and numpy inputs
+        def to_tensor(x):
+            if isinstance(x, np.ndarray):
+                return torch.from_numpy(x)
+            return x
+        
+        X[i, :L_i] = to_tensor(out_dict["X"])
+        X_m[i, :L_i] = to_tensor(out_dict["X_m"])
+        mask[i, :L_i] = 1
+        S[i, :L_i] = to_tensor(out_dict["S"])
+        R_idx[i, :L_i] = to_tensor(out_dict["R_idx"])
+        chain_labels[i, :L_i] = to_tensor(out_dict["chain_labels"])
+        
+        protein_mask[i, :L_i] = to_tensor(out_dict["protein_mask"])
+        dna_mask[i, :L_i] = to_tensor(out_dict["dna_mask"])
+        rna_mask[i, :L_i] = to_tensor(out_dict["rna_mask"])
+        
+        R_polymer_type[i, :L_i] = to_tensor(out_dict["R_polymer_type"])
+        
+        interface_mask[i, :L_i] = to_tensor(out_dict["interface_mask"])
+        base_pair_mask[i, :L_i] = to_tensor(out_dict["base_pair_mask"])
+        base_pair_index[i, :L_i] = to_tensor(out_dict["base_pair_index"])
+        canonical_base_pair_mask[i, :L_i] = to_tensor(out_dict["canonical_base_pair_mask"])
+        canonical_base_pair_index[i, :L_i] = to_tensor(out_dict["canonical_base_pair_index"])
+        
+        aligned_ppm[i, :L_i] = to_tensor(out_dict["aligned_ppm"])
+        ppm_mask[i, :L_i] = to_tensor(out_dict["ppm_mask"])
+        
+        structure_paths.append(out_dict.get("structure_path", ""))
+        assembly_ids.append(out_dict.get("assembly_id", ""))
+    
+    # Create output dict (tensors are on CPU, will be moved to GPU in training loop)
+    result = {
+        "X": X,
+        "X_m": X_m,
+        "mask": mask,
+        "S": S.long(),
+        "R_idx": R_idx,
+        "chain_labels": chain_labels,
+        "protein_mask": protein_mask,
+        "dna_mask": dna_mask,
+        "rna_mask": rna_mask,
+        "R_polymer_type": R_polymer_type,
+        "interface_mask": interface_mask,
+        "base_pair_mask": base_pair_mask,
+        "base_pair_index": base_pair_index,
+        "canonical_base_pair_mask": canonical_base_pair_mask,
+        "canonical_base_pair_index": canonical_base_pair_index,
+        "aligned_ppm": aligned_ppm,
+        "ppm_mask": ppm_mask,
+        "structure_path": structure_paths,
+        "assembly_id": assembly_ids,
+    }
+    
+    return result
+
+
+def create_collate_fn(polytype_to_int, restype_to_int, atom_dict):
+    """
+    Factory function to create a collate_fn with the required dictionaries.
+    """
+    def collate_fn(batch):
+        return collate_fn_optimized(batch, polytype_to_int, restype_to_int, atom_dict)
+    return collate_fn
+
 def sample_bernoulli_rv(p):
     """
     Given a probability p, representing the success probability of a Bernoulli
@@ -331,8 +498,9 @@ class PDBDataset(torch.utils.data.Dataset):
         """
         index = [[(example_dict, assembly_id), (example_dict, assembly_id)]]
         """
-        x = [self.loader(example_dict, assembly_id) for (example_dict, assembly_id) in index[0]]
-        return x
+        results = [self.loader(example_dict, assembly_id) for (example_dict, assembly_id) in index[0]]
+        valid_results = [r for r in results if isinstance(r[0], dict)]
+        return valid_results if valid_results else results
 
     def parse_structure(self, structure_path):
         if structure_path[-4:] == ".pdb" or structure_path[-7:] == ".pdb.gz":
@@ -934,27 +1102,31 @@ class PDBDataset(torch.utils.data.Dataset):
                 canonical base pairing partner for residues that are marked in
                 the canonical_base_pair_mask.
         """
-        out_dict["interface_mask"] = \
-            np.load(example_dict["asmb_interface_masks_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int32)
-        out_dict["side_chain_interface_mask"] = \
-            np.load(example_dict["asmb_side_chain_interface_masks_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int32)
-        out_dict["nearest_protein_side_chain_index"] = \
-            np.load(example_dict["asmb_nearest_protein_side_chain_index_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int64)
-        out_dict["base_pair_mask"] = \
-            np.load(example_dict["asmb_base_pair_masks_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int32)
-        out_dict["base_pair_index"] = \
-            np.load(example_dict["asmb_base_pair_index_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int64)
-        out_dict["canonical_base_pair_mask"] = \
-            np.load(example_dict["asmb_canonical_base_pair_masks_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int32)
-        out_dict["canonical_base_pair_index"] = \
-            np.load(example_dict["asmb_canonical_base_pair_index_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int64)
+        L = out_dict["macromolecule_L"]
+        
+        # Helper function to safely load preprocessed data or use defaults
+        def load_or_default(key, default_dtype, default_value=0):
+            if key in example_dict and pd.notna(example_dict.get(key)):
+                try:
+                    return np.load(example_dict[key], allow_pickle=True).item()[assembly_id].astype(default_dtype)
+                except Exception:
+                    pass
+            return np.full(L, default_value, dtype=default_dtype)
+        
+        out_dict["interface_mask"] = load_or_default(
+            "asmb_interface_masks_path", np.int32, 0)
+        out_dict["side_chain_interface_mask"] = load_or_default(
+            "asmb_side_chain_interface_masks_path", np.int32, 0)
+        out_dict["nearest_protein_side_chain_index"] = load_or_default(
+            "asmb_nearest_protein_side_chain_index_path", np.int64, 0)
+        out_dict["base_pair_mask"] = load_or_default(
+            "asmb_base_pair_masks_path", np.int32, 0)
+        out_dict["base_pair_index"] = load_or_default(
+            "asmb_base_pair_index_path", np.int64, 0)
+        out_dict["canonical_base_pair_mask"] = load_or_default(
+            "asmb_canonical_base_pair_masks_path", np.int32, 0)
+        out_dict["canonical_base_pair_index"] = load_or_default(
+            "asmb_canonical_base_pair_index_path", np.int64, 0)
 
     def apply_crop_mask(self, out_dict, mask_to_keep):
         """
@@ -1471,18 +1643,31 @@ def make_batch_iter(df, batch_tokens, length_cutoff, date_cutoff, crop_large_str
     L_list = []
     name_list = []
     for example_dict in samples:
-        # Assembly ID to length dictionary.
-        asmb_lengths_dict = np.load(example_dict["asmb_lengths_path"], allow_pickle = True).item()
-        assembly_id_list = list(asmb_lengths_dict.keys())
+        # Check if preprocessed data exists
+        if "asmb_lengths_path" in example_dict and pd.notna(example_dict.get("asmb_lengths_path")):
+            # Use preprocessed assembly lengths
+            try:
+                asmb_lengths_dict = np.load(example_dict["asmb_lengths_path"], allow_pickle = True).item()
+                assembly_id_list = list(asmb_lengths_dict.keys())
 
-        num_assemblies = len(assembly_id_list)
-        if num_assemblies > 1:
-            idx = np.random.randint(0, high = num_assemblies, dtype = int)
+                num_assemblies = len(assembly_id_list)
+                if num_assemblies > 1:
+                    idx = np.random.randint(0, high = num_assemblies, dtype = int)
+                else:
+                    idx = 0
+                assembly_id = assembly_id_list[idx]
+
+                (macromolecule_L, protein_L, dna_L, rna_L) = asmb_lengths_dict[assembly_id]
+            except Exception:
+                # Fallback: use default assembly and estimate length
+                assembly_id = "1"
+                macromolecule_L = batch_tokens  # Will be determined at load time
+                dna_L, rna_L = 1, 0  # Assume has NA
         else:
-            idx = 0
-        assembly_id = assembly_id_list[idx]
-
-        (macromolecule_L, protein_L, dna_L, rna_L) = asmb_lengths_dict[assembly_id]
+            # No preprocessed data: use default assembly and estimate length
+            assembly_id = "1"
+            macromolecule_L = batch_tokens  # Will be determined at load time
+            dna_L, rna_L = 1, 0  # Assume has NA
 
         if macromolecule_L >= length_cutoff and len(L_list) < max_number_of_pdbs:
             if macromolecule_L > batch_tokens and crop_large_structures and (dna_L + rna_L) > 0:
