@@ -31,9 +31,6 @@ def featurize(batch, polytype_to_int, restype_to_int, atom_dict, device):
         canonical_base_pair_mask = torch.zeros([B, L_max], dtype=torch.int32)
         canonical_base_pair_index = torch.zeros([B, L_max], dtype=torch.int64)
 
-        aligned_ppm = torch.zeros([B, L_max, len(restype_to_int)], dtype=torch.float64)
-        ppm_mask = torch.zeros([B, L_max], dtype=torch.int32)
-
         structure_paths = []
         assembly_ids = []
 
@@ -57,9 +54,6 @@ def featurize(batch, polytype_to_int, restype_to_int, atom_dict, device):
             base_pair_index[i,:L_stack[i]] = out_dict["base_pair_index"][None,]
             canonical_base_pair_mask[i,:L_stack[i]] = out_dict["canonical_base_pair_mask"][None,]
             canonical_base_pair_index[i,:L_stack[i]] = out_dict["canonical_base_pair_index"][None,]
-
-            aligned_ppm[i,:L_stack[i]] = out_dict["aligned_ppm"][None,]
-            ppm_mask[i,:L_stack[i]] = out_dict["ppm_mask"][None,]
 
             structure_paths.append(out_dict["structure_path"])
             assembly_ids.append(out_dict["assembly_id"])
@@ -85,9 +79,6 @@ def featurize(batch, polytype_to_int, restype_to_int, atom_dict, device):
         out_dict["base_pair_index"] = base_pair_index.to(device)
         out_dict["canonical_base_pair_mask"] = canonical_base_pair_mask.to(device)
         out_dict["canonical_base_pair_index"] = canonical_base_pair_index.to(device)
-
-        out_dict["aligned_ppm"] = aligned_ppm.to(device)
-        out_dict["ppm_mask"] = ppm_mask.to(device)
 
         out_dict["structure_path"] = structure_paths
         out_dict["assembly_id"] = assembly_ids
@@ -116,9 +107,7 @@ def loss_smoothed(S,
                   polymer_restype_nums, 
                   weight=0.1,  
                   tokens=2000.0, 
-                  num_letters=33,
-                  ppm_mask=None,
-                  aligned_ppm=None,):
+                  num_letters=33):
     """ Negative log probabilities """
     protein_mask = polymer_masks["protein"]
     dna_mask = polymer_masks["dna"]
@@ -130,8 +119,6 @@ def loss_smoothed(S,
     all_polymer_restype_mask = protein_restype_mask + dna_restype_mask + rna_restype_mask
 
     S_onehot = torch.nn.functional.one_hot(S, num_letters).to(torch.float64)
-
-    S_onehot[ppm_mask.bool()] = aligned_ppm[ppm_mask.bool()]
 
     label_smoothing_eps = protein_mask[:,:,None] * protein_restype_mask[None,None,:] * (weight / polymer_restype_nums["protein"]) + \
                           dna_mask[:,:,None] * dna_restype_mask[None,None,:] * (weight / polymer_restype_nums["dna"]) + \
