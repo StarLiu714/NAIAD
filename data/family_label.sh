@@ -15,4 +15,5 @@ fasta_path=$fasta_splits_directory"/all_protein_sequences_"$SLURM_ARRAY_TASK_ID"
 output_path=$family_label_output_directory"/family_label_"$SLURM_ARRAY_TASK_ID".csv"
 
 # Run InterProScan on the fasta.
-/home/akubaney/software/interproscan/interproscan.sh -i $fasta_path -f tsv -o $output_path -appl Pfam
+INTERPROSCAN_PATH=${INTERPROSCAN_PATH:-interproscan.sh}
+"$INTERPROSCAN_PATH" -i "$fasta_path" -f tsv -o "$output_path" -appl Pfam

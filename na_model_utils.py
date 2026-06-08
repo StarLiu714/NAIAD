@@ -6,10 +6,31 @@ import torch.utils.checkpoint
 import torch.nn as nn
 
 def featurize(batch, polytype_to_int, restype_to_int, atom_dict, device):
-    batch = [b for b in batch if type(b[0])!=list]
+    # Filter out failed structures (where b[0] is "pass" instead of a dict)
+    # Also handle nested list from DataLoader
+    valid_batch = []
+    for b in batch:
+        # Skip if b[0] is a list (nested batch structure)
+        if isinstance(b[0], list):
+            continue
+        # Skip if b[0] is not a dict (e.g., "pass" for failed structures)
+        if not isinstance(b[0], dict):
+            continue
+        # Skip if b[1] is not a valid length (int or tensor)
+        if not isinstance(b[1], (int, torch.Tensor)):
+            continue
+        valid_batch.append(b)
+    batch = valid_batch
     B = len(batch)
     if B > 0:
-        L_stack = torch.stack([b[1] for b in batch])
+        # Convert lengths to tensors if they are integers
+        L_list = []
+        for b in batch:
+            L = b[1]
+            if isinstance(L, int):
+                L = torch.tensor(L)
+            L_list.append(L)
+        L_stack = torch.stack(L_list)
         L_max = torch.max(L_stack)
         X = torch.zeros([B, L_max, len(atom_dict), 3], dtype=torch.float32)
         X_m = torch.zeros([B, L_max, len(atom_dict)], dtype=torch.int32)
@@ -30,6 +51,9 @@ def featurize(batch, polytype_to_int, restype_to_int, atom_dict, device):
         base_pair_index = torch.zeros([B, L_max], dtype=torch.int64)
         canonical_base_pair_mask = torch.zeros([B, L_max], dtype=torch.int32)
         canonical_base_pair_index = torch.zeros([B, L_max], dtype=torch.int64)
+
+        aligned_ppm = torch.zeros([B, L_max, len(restype_to_int)], dtype=torch.float64)
+        ppm_mask = torch.zeros([B, L_max], dtype=torch.int32)
 
         structure_paths = []
         assembly_ids = []
@@ -55,6 +79,9 @@ def featurize(batch, polytype_to_int, restype_to_int, atom_dict, device):
             canonical_base_pair_mask[i,:L_stack[i]] = out_dict["canonical_base_pair_mask"][None,]
             canonical_base_pair_index[i,:L_stack[i]] = out_dict["canonical_base_pair_index"][None,]
 
+            aligned_ppm[i,:L_stack[i]] = out_dict["aligned_ppm"][None,]
+            ppm_mask[i,:L_stack[i]] = out_dict["ppm_mask"][None,]
+
             structure_paths.append(out_dict["structure_path"])
             assembly_ids.append(out_dict["assembly_id"])
 
@@ -79,6 +106,9 @@ def featurize(batch, polytype_to_int, restype_to_int, atom_dict, device):
         out_dict["base_pair_index"] = base_pair_index.to(device)
         out_dict["canonical_base_pair_mask"] = canonical_base_pair_mask.to(device)
         out_dict["canonical_base_pair_index"] = canonical_base_pair_index.to(device)
+
+        out_dict["aligned_ppm"] = aligned_ppm.to(device)
+        out_dict["ppm_mask"] = ppm_mask.to(device)
 
         out_dict["structure_path"] = structure_paths
         out_dict["assembly_id"] = assembly_ids
@@ -107,7 +137,9 @@ def loss_smoothed(S,
                   polymer_restype_nums, 
                   weight=0.1,  
                   tokens=2000.0, 
-                  num_letters=33):
+                  num_letters=33,
+                  ppm_mask=None,
+                  aligned_ppm=None,):
     """ Negative log probabilities """
     protein_mask = polymer_masks["protein"]
     dna_mask = polymer_masks["dna"]
@@ -119,6 +151,8 @@ def loss_smoothed(S,
     all_polymer_restype_mask = protein_restype_mask + dna_restype_mask + rna_restype_mask
 
     S_onehot = torch.nn.functional.one_hot(S, num_letters).to(torch.float64)
+
+    S_onehot[ppm_mask.bool()] = aligned_ppm[ppm_mask.bool()]
 
     label_smoothing_eps = protein_mask[:,:,None] * protein_restype_mask[None,None,:] * (weight / polymer_restype_nums["protein"]) + \
                           dna_mask[:,:,None] * dna_restype_mask[None,None,:] * (weight / polymer_restype_nums["dna"]) + \
@@ -631,6 +665,213 @@ class ProteinMPNN(nn.Module):
         probs = torch.nn.functional.softmax(logits, dim=-1)
 
         return log_probs, probs
+
+
+class ProteinMPNNDiffusion(nn.Module):
+    """
+    NA-MPNN with Absorbing State Diffusion support.
+    
+    Key differences from ProteinMPNN:
+    - Bidirectional attention in decoder (no causal masking)
+    - Accepts masked sequences as input
+    - Predicts all positions simultaneously (MLM-style)
+    
+    This enables iterative denoising for sequence generation,
+    inspired by ProRefiner and DPLM.
+    """
+    def __init__(self, 
+                 node_features=128, 
+                 edge_features=128,
+                 hidden_dim=128, 
+                 num_encoder_layers=3, 
+                 num_decoder_layers=3,
+                 atom_dict=None,
+                 restype_to_int=None,
+                 polytype_to_int=None,
+                 vocab=33,
+                 num_letters=33, 
+                 k_neighbors=32, 
+                 protein_augment_eps=0.1, 
+                 dna_augment_eps=0.1,
+                 rna_augment_eps=0.1,
+                 dropout=0.1, 
+                 na_ref_atom="C1'",
+                 include_pred_na_N=1,
+                 use_sequence_context=True,
+                 device=None):
+        """
+        Args:
+            use_sequence_context: If True, use sequence embeddings in decoder
+                                  (allows model to see unmasked positions)
+        """
+        super(ProteinMPNNDiffusion, self).__init__()
+
+        # Hyperparameters
+        self.node_features = node_features
+        self.edge_features = edge_features
+        self.vocab = vocab
+        self.hidden_dim = hidden_dim
+        self.use_sequence_context = use_sequence_context
+
+        if restype_to_int is None:
+            raise Exception("restype_to_int dictionary is necessary!")
+
+        self.mask_token = restype_to_int["MAS"]
+
+        self.features = ProteinFeatures(node_features, 
+                                        edge_features,
+                                        top_k=k_neighbors,
+                                        atom_dict=atom_dict,
+                                        polytype_to_int=polytype_to_int,
+                                        protein_augment_eps=protein_augment_eps, 
+                                        dna_augment_eps=dna_augment_eps, 
+                                        rna_augment_eps=rna_augment_eps,
+                                        na_ref_atom=na_ref_atom,
+                                        include_pred_na_N=include_pred_na_N,
+                                        device=device)
+
+        self.W_e = nn.Linear(edge_features, hidden_dim, bias=True)
+        self.W_v = nn.Linear(node_features, hidden_dim, bias=True)
+        self.W_s = nn.Embedding(vocab, hidden_dim)
+
+        # Encoder layers
+        self.encoder_layers = nn.ModuleList([
+            EncLayer(hidden_dim, hidden_dim*2, dropout=dropout)
+            for _ in range(num_encoder_layers)
+        ])
+
+        # Decoder layers (bidirectional, no causal masking)
+        self.decoder_layers = nn.ModuleList([
+            DecLayer(hidden_dim, hidden_dim*3, dropout=dropout)
+            for _ in range(num_decoder_layers)
+        ])
+
+        self.W_out = nn.Linear(hidden_dim, num_letters, bias=True)
+
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, feature_dict, return_embeddings=False):
+        """
+        Forward pass with bidirectional attention.
+        
+        Unlike autoregressive ProteinMPNN, this uses full bidirectional
+        attention in the decoder, allowing the model to see all context
+        (both masked and unmasked positions) when making predictions.
+        
+        Args:
+            feature_dict: Dictionary containing:
+                - X: [B, L, num_atoms, 3] Coordinates
+                - S: [B, L] Sequence (may contain MASK tokens)
+                - mask: [B, L] Valid position mask
+                - protein_mask, dna_mask, rna_mask: Polymer type masks
+                - R_idx, chain_labels: Residue indices and chain labels
+                - R_polymer_type: Polymer type for each position
+            return_embeddings: If True, also return hidden embeddings
+        
+        Returns:
+            log_probs: [B, L, V] Log probabilities for each position
+            probs: [B, L, V] Probabilities for each position
+            (optional) h_V: [B, L, H] Hidden embeddings
+        """
+        X = feature_dict["X"] 
+        S = feature_dict["S"]  # May contain MASK tokens
+        mask = feature_dict["mask"]
+       
+        device = X.device
+        
+        # Prepare node and edge embeddings from structure
+        V, E, E_idx = self.features(feature_dict)
+        h_V = self.W_v(V)
+        h_E = self.W_e(E)
+
+        # Encoder: bidirectional self-attention over structure
+        mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
+        mask_attend = mask.unsqueeze(-1) * mask_attend
+        
+        for layer in self.encoder_layers:
+            if self.training:
+                h_V, h_E = torch.utils.checkpoint.checkpoint(
+                    layer, h_V, h_E, E_idx, mask, mask_attend, 
+                    use_reentrant=False
+                )
+            else:
+                h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
+        
+        # Sequence embeddings (including MASK token embeddings)
+        h_S = self.W_s(S)
+        
+        # Decoder: BIDIRECTIONAL attention (key difference from autoregressive)
+        # All positions can attend to all other positions
+        # This allows the model to use context from both directions
+        
+        if self.use_sequence_context:
+            # Include sequence information in message passing
+            h_ES = cat_neighbors_nodes(h_S, h_E, E_idx)
+        else:
+            # Structure-only context (useful for initial generation)
+            h_ES = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
+        
+        # Build combined embeddings
+        h_EXV_encoder = cat_neighbors_nodes(h_V, h_ES, E_idx)
+        
+        # Bidirectional attention mask (all valid positions attend to each other)
+        # No causal masking - this is the key for diffusion!
+        # Shape: [B, L, 1, 1] * [B, L, K, 1] -> [B, L, K, 1]
+        mask_1D = mask.view([mask.size(0), mask.size(1), 1, 1])
+        mask_attend_decoder = mask_1D * gather_nodes(mask.unsqueeze(-1), E_idx)
+        
+        for layer in self.decoder_layers:
+            h_ESV = h_EXV_encoder * mask_attend_decoder
+            if self.training:
+                h_V = torch.utils.checkpoint.checkpoint(
+                    layer, h_V, h_ESV, mask, 
+                    use_reentrant=False
+                )
+            else:
+                h_V = layer(h_V, h_ESV, mask)
+
+        logits = self.W_out(h_V)
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+
+        if return_embeddings:
+            return log_probs, probs, h_V
+        return log_probs, probs
+    
+    def forward_with_mask_ratio(self, feature_dict, mask_ratio=None):
+        """
+        Forward pass that also returns mask ratio for loss computation.
+        
+        This is a convenience method for training that packages
+        the mask ratio with the outputs.
+        """
+        log_probs, probs = self.forward(feature_dict)
+        return log_probs, probs, mask_ratio
+
+    @classmethod
+    def from_pretrained_mpnn(cls, pretrained_model, **kwargs):
+        """
+        Initialize diffusion model from pretrained ProteinMPNN weights.
+        
+        This allows fine-tuning an existing model for diffusion.
+        """
+        # Create new model with same architecture
+        model = cls(**kwargs)
+        
+        # Copy weights from pretrained model
+        pretrained_state = pretrained_model.state_dict()
+        model_state = model.state_dict()
+        
+        # Copy matching weights
+        for name, param in pretrained_state.items():
+            if name in model_state and model_state[name].shape == param.shape:
+                model_state[name] = param
+        
+        model.load_state_dict(model_state)
+        return model
+
 
 class NoamOpt:
     "Optim wrapper that implements rate."

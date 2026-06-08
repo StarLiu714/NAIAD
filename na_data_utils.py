@@ -1,6 +1,177 @@
 import numpy as np
+import pandas as pd
 import torch
 import itertools
+import copy
+import ast
+import os
+
+
+def convert_sample_to_tensors(out_dict):
+    """
+    Convert a single sample's numpy arrays to PyTorch tensors.
+    This is called in worker processes to enable parallel tensor creation.
+    
+    Args:
+        out_dict: Dictionary containing numpy arrays from the loader
+        
+    Returns:
+        Dictionary with numpy arrays converted to tensors
+    """
+    if out_dict == "pass":
+        return out_dict
+    
+    # Keys that should be converted to tensors
+    tensor_keys = [
+        "X", "X_m", "S", "R_idx", "chain_labels",
+        "protein_mask", "dna_mask", "rna_mask", "R_polymer_type",
+        "interface_mask", "base_pair_mask", "base_pair_index",
+        "canonical_base_pair_mask", "canonical_base_pair_index",
+        "aligned_ppm", "ppm_mask"
+    ]
+    
+    for key in tensor_keys:
+        if key in out_dict and isinstance(out_dict[key], np.ndarray):
+            out_dict[key] = torch.from_numpy(out_dict[key])
+    
+    return out_dict
+
+
+def collate_fn_optimized(batch, polytype_to_int, restype_to_int, atom_dict):
+    """
+    Custom collate function that handles batch collation in worker processes.
+    This moves the heavy tensor creation work from main thread to workers.
+    
+    Args:
+        batch: List of samples from __getitem__
+        polytype_to_int: Dict mapping polymer types to integers
+        restype_to_int: Dict mapping residue types to integers
+        atom_dict: Dict mapping atom names to indices
+        
+    Returns:
+        Dictionary of batched tensors (still on CPU, will be moved to GPU in training loop)
+    """
+    # Flatten the batch structure
+    # batch is [[[(out_dict, L), ...], ...]]
+    valid_items = []
+    for item in batch:
+        if isinstance(item, list):
+            for sub_item in item:
+                if isinstance(sub_item, tuple) and len(sub_item) == 2:
+                    out_dict, L = sub_item
+                    if isinstance(out_dict, dict) and isinstance(L, (int, torch.Tensor)):
+                        valid_items.append((out_dict, L))
+    
+    if len(valid_items) == 0:
+        return None
+    
+    B = len(valid_items)
+    
+    # Get max length
+    L_list = []
+    for out_dict, L in valid_items:
+        if isinstance(L, int):
+            L = torch.tensor(L)
+        L_list.append(L)
+    L_stack = torch.stack(L_list)
+    L_max = torch.max(L_stack).item()
+    if L_max == 0:
+        return None  # Skip degenerate batch with empty sequences
+    
+    # Pre-allocate tensors
+    X = torch.zeros([B, L_max, len(atom_dict), 3], dtype=torch.float32)
+    X_m = torch.zeros([B, L_max, len(atom_dict)], dtype=torch.int32)
+    mask = torch.zeros([B, L_max], dtype=torch.int32)
+    S = restype_to_int["PAD"] * torch.ones([B, L_max], dtype=torch.int64)
+    R_idx = -100 * torch.ones([B, L_max], dtype=torch.int32)
+    chain_labels = -1 * torch.ones([B, L_max], dtype=torch.int64)
+    
+    protein_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    dna_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    rna_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    
+    R_polymer_type = polytype_to_int["PAD"] * torch.ones([B, L_max], dtype=torch.int64)
+    
+    interface_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    base_pair_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    base_pair_index = torch.zeros([B, L_max], dtype=torch.int64)
+    canonical_base_pair_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    canonical_base_pair_index = torch.zeros([B, L_max], dtype=torch.int64)
+    
+    aligned_ppm = torch.zeros([B, L_max, len(restype_to_int)], dtype=torch.float64)
+    ppm_mask = torch.zeros([B, L_max], dtype=torch.int32)
+    
+    structure_paths = []
+    assembly_ids = []
+    
+    # Fill tensors
+    for i, (out_dict, _) in enumerate(valid_items):
+        L_i = L_stack[i].item()
+        
+        # Handle both tensor and numpy inputs
+        def to_tensor(x):
+            if isinstance(x, np.ndarray):
+                return torch.from_numpy(x)
+            return x
+        
+        X[i, :L_i] = to_tensor(out_dict["X"])
+        X_m[i, :L_i] = to_tensor(out_dict["X_m"])
+        mask[i, :L_i] = 1
+        S[i, :L_i] = to_tensor(out_dict["S"])
+        R_idx[i, :L_i] = to_tensor(out_dict["R_idx"])
+        chain_labels[i, :L_i] = to_tensor(out_dict["chain_labels"])
+        
+        protein_mask[i, :L_i] = to_tensor(out_dict["protein_mask"])
+        dna_mask[i, :L_i] = to_tensor(out_dict["dna_mask"])
+        rna_mask[i, :L_i] = to_tensor(out_dict["rna_mask"])
+        
+        R_polymer_type[i, :L_i] = to_tensor(out_dict["R_polymer_type"])
+        
+        interface_mask[i, :L_i] = to_tensor(out_dict["interface_mask"])
+        base_pair_mask[i, :L_i] = to_tensor(out_dict["base_pair_mask"])
+        base_pair_index[i, :L_i] = to_tensor(out_dict["base_pair_index"])
+        canonical_base_pair_mask[i, :L_i] = to_tensor(out_dict["canonical_base_pair_mask"])
+        canonical_base_pair_index[i, :L_i] = to_tensor(out_dict["canonical_base_pair_index"])
+        
+        aligned_ppm[i, :L_i] = to_tensor(out_dict["aligned_ppm"])
+        ppm_mask[i, :L_i] = to_tensor(out_dict["ppm_mask"])
+        
+        structure_paths.append(out_dict.get("structure_path", ""))
+        assembly_ids.append(out_dict.get("assembly_id", ""))
+    
+    # Create output dict (tensors are on CPU, will be moved to GPU in training loop)
+    result = {
+        "X": X,
+        "X_m": X_m,
+        "mask": mask,
+        "S": S.long(),
+        "R_idx": R_idx,
+        "chain_labels": chain_labels,
+        "protein_mask": protein_mask,
+        "dna_mask": dna_mask,
+        "rna_mask": rna_mask,
+        "R_polymer_type": R_polymer_type,
+        "interface_mask": interface_mask,
+        "base_pair_mask": base_pair_mask,
+        "base_pair_index": base_pair_index,
+        "canonical_base_pair_mask": canonical_base_pair_mask,
+        "canonical_base_pair_index": canonical_base_pair_index,
+        "aligned_ppm": aligned_ppm,
+        "ppm_mask": ppm_mask,
+        "structure_path": structure_paths,
+        "assembly_id": assembly_ids,
+    }
+    
+    return result
+
+
+def create_collate_fn(polytype_to_int, restype_to_int, atom_dict):
+    """
+    Factory function to create a collate_fn with the required dictionaries.
+    """
+    def collate_fn(batch):
+        return collate_fn_optimized(batch, polytype_to_int, restype_to_int, atom_dict)
+    return collate_fn
 
 def sample_bernoulli_rv(p):
     """
@@ -85,7 +256,14 @@ class PDBDataset(torch.utils.data.Dataset):
                  crop_large_structures=0,
                  batch_tokens=6000,
                  na_ref_atom="C1'",
-                 drop_protein_probability=0):
+                 parse_ppms=0,
+                 min_overlap_length=5,
+                 drop_protein_probability=0,
+                 na_only_as_uniform_ppm=0,
+                 protein_interface_residue_mutation_probability=0,
+                 mutate_base_pair_together=0,
+                 mutate_entire_side_chain_interface_probability=0,
+                 na_non_interface_as_uniform_ppm=0):
         self.protein_backbone_occ_cutoff = protein_backbone_occ_cutoff
         self.protein_side_chain_occ_cutoff = protein_side_chain_occ_cutoff
         self.dna_backbone_occ_cutoff = dna_backbone_occ_cutoff
@@ -104,6 +282,14 @@ class PDBDataset(torch.utils.data.Dataset):
         self.na_ref_atom = na_ref_atom
 
         self.drop_protein_probability = drop_protein_probability
+        self.na_only_as_uniform_ppm = na_only_as_uniform_ppm
+        self.protein_interface_residue_mutation_probability = protein_interface_residue_mutation_probability
+        self.mutate_base_pair_together = mutate_base_pair_together
+        self.mutate_entire_side_chain_interface_probability = mutate_entire_side_chain_interface_probability
+        self.na_non_interface_as_uniform_ppm = na_non_interface_as_uniform_ppm
+
+        self.parse_ppms = parse_ppms
+        self.min_overlap_length = min_overlap_length
 
         self.atom_list_to_save = atom_list_to_save
 
@@ -313,8 +499,9 @@ class PDBDataset(torch.utils.data.Dataset):
         """
         index = [[(example_dict, assembly_id), (example_dict, assembly_id)]]
         """
-        x = [self.loader(example_dict, assembly_id) for (example_dict, assembly_id) in index[0]]
-        return x
+        results = [self.loader(example_dict, assembly_id) for (example_dict, assembly_id) in index[0]]
+        valid_results = [r for r in results if isinstance(r[0], dict)]
+        return valid_results if valid_results else results
 
     def parse_structure(self, structure_path):
         if structure_path[-4:] == ".pdb" or structure_path[-7:] == ".pdb.gz":
@@ -323,6 +510,384 @@ class PDBDataset(torch.utils.data.Dataset):
             return self.cif_parser.parse(structure_path)
         else:
             raise Exception(f"{structure_path}: Unknown structure path extension.")
+
+    def load_ppms(self, ppm_paths_str, randomize_experimental_ppms, ppm_base_dir=None):
+        """
+        Given a list of lists of ppm paths, with each sublist representing
+        multiple experimental alternatives for each ppm, randomly sample one
+        ppm path from each sublist, load the ppms from these paths, and
+        append their base pairing ppms.
+
+        Arguments:
+            ppm_paths_str (str): a string representing a list of lists, where 
+                each sublist contains strings of ppm paths. Each sublist 
+                represents experimental alternatives for the same ppm.
+            randomize_equivalent_ppms (bool): if True, randomly select a random 
+                ppm from each sublist of experimental ppms. If False, take the
+                first.
+            ppm_base_dir (str): optional base directory used to resolve relative
+                ppm paths before reading.
+        
+        Returns:
+            ppms ((np.float64 np.ndarray, str) List): a list of ppms 
+                (L x 4 arrays) containing the probabilities of DA, DC, DG, DT 
+                for DNA and A, C, G, U for RNA, and an associated string
+                indicating the ppm type ("dna" or "rna").
+            ppm_paths_chosen (str List): a list of the corresponding ppm paths
+                that were chosen.
+
+        """
+        # Parse the ppm_paths_list_of_lists_str into a list of lists.
+        ppm_paths = ast.literal_eval(ppm_paths_str)
+
+        ppms = []
+        ppm_paths_chosen = []
+        for experimental_ppm_paths_sublist in ppm_paths:
+            # Randomly select one of the expermental ppms for each sublist.
+            if randomize_experimental_ppms:          
+                ppm_path = np.random.choice(experimental_ppm_paths_sublist)
+            else:
+                ppm_path = experimental_ppm_paths_sublist[0]
+
+            if ppm_base_dir is not None and not os.path.isabs(str(ppm_path)):
+                ppm_path = os.path.normpath(os.path.join(ppm_base_dir, str(ppm_path)))
+            
+            # Save the chosen path.
+            ppm_paths_chosen.append(ppm_path)
+
+            # Read the ppm, represented as a csv.
+            ppm_df = pd.read_csv(ppm_path)
+
+            # Create the ppm.
+            if "T" in ppm_df.columns:
+                ppm = np.stack((np.array(ppm_df["A"], dtype = np.float64),
+                                np.array(ppm_df["C"], dtype = np.float64),
+                                np.array(ppm_df["G"], dtype = np.float64),
+                                np.array(ppm_df["T"], dtype = np.float64)),
+                            axis = -1)
+                ppm_type = "dna"
+            elif "U" in ppm_df.columns:
+                ppm = np.stack((np.array(ppm_df["A"], dtype = np.float64),
+                                np.array(ppm_df["C"], dtype = np.float64),
+                                np.array(ppm_df["G"], dtype = np.float64),
+                                np.array(ppm_df["U"], dtype = np.float64)),
+                            axis = -1)
+                ppm_type = "rna"
+            else:
+                raise Exception(f"PPM at {ppm_path} is not valid.")
+
+            # Compute the base pairing ppm.
+            bp_ppm = np.copy(np.flip(np.flip(ppm, axis = 1), axis = 0))
+
+            ppms.append((ppm, ppm_type))
+            ppms.append((bp_ppm, ppm_type))
+
+        return ppms, ppm_paths_chosen
+    
+    def calculate_information_content(self, ppm, eps = 1e-10):
+        """
+        Calculate the per-position information content of a position probability
+        matrix (PPM).
+
+        Arguments:
+            ppm (np.float64 np.ndarray): an L x 4 array of representing the PPM.
+            eps (float, optional): a small epsilon, to be added to each 
+                probability to prevent taking a logarithm of 0.
+        
+        Returns:
+            per_position_ic (np.float64 np.ndarray): the per-position
+                information content of the ppm.
+        """
+        # Check the shape of the ppm.
+        assert(ppm.shape[-1] == 4)
+
+        # Add epsilon to each column of probabilities and normalize.
+        ppm_plus_eps = ppm + eps
+        ppm_eps_norm = ppm_plus_eps / np.sum(ppm_plus_eps, axis = -1)[:, None]
+
+        # Compute the per-position information content.
+        per_position_ic = np.sum(np.log(ppm_eps_norm) / np.log(0.25), axis = -1)
+
+        return per_position_ic
+
+    def calculate_pearson_correlation_coeffcient(self, ppm, S_one_hot):
+        """
+        Calculate the per-position pearson correlation coefficient between the
+        ppm and the (one-hot) nucleic acid sequence.
+
+        Arguments:
+            ppm (np.float64 np.ndarray): an L x 4 array of representing the PPM
+            S_one_hot (np.float64 np.ndarray): an L x 4 array representing the
+                one-hot nucleic acid sequence.
+        
+        Returns:
+            per_position_pcc (np.float64 np.ndarray): the per-position pearson
+                correlation coefficient between the ppm and one-hot sequence.
+                Note, if the ppm is the uniform ppm, returns 0 by default.
+        """
+        # Check the shape of the ppm and the S_one_hot.
+        assert(ppm.shape[-1] == 4)
+        assert(S_one_hot.shape[-1] == 4)
+        
+        # Compute the per-position mean of the ppm and S_one_hot
+        ppm_bar = np.mean(ppm, axis = -1)
+        S_one_hot_bar = np.mean(S_one_hot, axis = -1)
+
+        # Calculate the per-position pearson correlation coefficient between
+        # the ppm and the one-hot sequence.
+        numerator = np.sum((ppm - ppm_bar[:, None]) * (S_one_hot - S_one_hot_bar[:, None]), axis = -1)
+        denominator = np.sqrt(np.sum((ppm - ppm_bar[:, None]) ** 2, axis = -1) * np.sum((S_one_hot - S_one_hot_bar[:, None]) ** 2, axis = -1))
+        
+        # Since S_one_hot is a one-hot vectors, the only way that the
+        # denominator is 0 is if the ppm is uniform. If this is the case,
+        # return 0 by default. This is okay since this is used as an alignment
+        # scoring mechanism.
+        denominator_non_zero_mask = denominator != 0
+        per_position_pcc = np.zeros_like(numerator)
+        np.place(per_position_pcc, denominator_non_zero_mask, 
+                 numerator[denominator_non_zero_mask] / denominator[denominator_non_zero_mask])
+
+        return per_position_pcc
+
+    def calculate_alignment_score(self, ppm, S_one_hot):
+        """
+        Calculate the per-position information content-weighted pearson
+        correlation coefficient between the ppm and the one-hot nucleic acid 
+        sequence, and return the sum.
+
+        Arguments:
+            ppm (np.float64 np.ndarray): an L x 4 array of representing the PPM.
+            S_one_hot (np.float64 np.ndarray): an L x 4 array representing the
+                one-hot nucleic acid sequence.
+        
+        Returns:
+            ic_weighted_pcc_sum (float): the sum of the per-position information 
+                content-weighted pearson correlation coefficient between 
+                the ppm and the one-hot DNA sequence.
+        """
+        # Check the shape of the ppm and the S_one_hot.
+        assert(ppm.shape[-1] == 4)
+        assert(S_one_hot.shape[-1] == 4)
+
+        # Calculate the per-position information content-weighted pearson
+        # correlation coefficient.
+        per_position_ic = self.calculate_information_content(ppm)
+        per_position_pcc = self.calculate_pearson_correlation_coeffcient(ppm, S_one_hot)
+        per_position_ic_weighted_pcc = per_position_pcc * (0.5 * per_position_ic)
+
+        # Calculate the sum of the per_position_ic_weighted_pcc.
+        ic_weighted_pcc_sum = np.sum(per_position_ic_weighted_pcc)
+
+        return ic_weighted_pcc_sum
+
+    def weighted_align(self, ppm, S_one_hot_na, S_non_x_mask):
+        """
+        Given a ppm and a sequence, find the maximum information 
+        content-weighted pearson correlation coefficient alignment(s).
+
+        Arguments:
+            ppm (np.float64 np.ndarray): an L x 4 array of representing the PPM.
+            S_one_hot_na (np.float64 np.ndarray): an L x 4 array representing 
+                the nucleic acid column subset of the sequence one-hot vector.
+            S_non_x_mask (bool np.ndarray): an L length mask that is True if
+                the corresponding column in S_one_hot_na has a 1, and False
+                otherwise.
+        
+        Returns:
+            max_score (float): the score of the best alignment.
+            opt_ppm_starts (int List): the starting index in the ppm for the
+                maximum score alignments.
+            opt_S_starts (int List): the starting index in the sequence for the
+                maximum score alignments.
+            opt_overlap_lens (int List): the overlap lengths of the maximum
+                score alignments.
+        """
+        # Check the shape of the ppm and the S_one_hot_na.
+        assert(ppm.shape[-1] == 4)
+        assert(S_one_hot_na.shape[-1] == 4)
+
+        max_score = -1 * np.inf
+        opt_ppm_starts = [0]
+        opt_S_starts = [0]
+        opt_overlap_lens = [0]
+
+        ppm_len = ppm.shape[0]
+        S_len = S_one_hot_na.shape[0]
+        
+        # Check all possible start positions in the ppm and sequence, as well
+        # as all possible overlap lengths.
+        for ppm_start in range(ppm_len):
+            for overlap_len in range(ppm_len - ppm_start + 1):
+                for S_start in range(S_len - overlap_len + 1):
+                    # Get the chunks of the ppm and sequence.
+                    ppm_chunk = ppm[ppm_start : ppm_start + overlap_len]
+                    S_one_hot_chunk = S_one_hot_na[S_start : S_start + overlap_len]
+                    S_non_x_mask_chunk = S_non_x_mask[S_start : S_start + overlap_len]
+
+                    # If the overlap or the number of non-DX tokens in the 
+                    # sequence chunk are less than the defined minimum overlap
+                    # length, continue.
+                    if overlap_len < self.min_overlap_length or \
+                       np.count_nonzero(S_non_x_mask_chunk) < self.min_overlap_length:
+                        continue
+
+                    # Remove any DX parts of the sequence and the corresponding
+                    # part of the ppm.
+                    ppm_chunk = ppm_chunk[S_non_x_mask_chunk]
+                    S_one_hot_chunk = S_one_hot_chunk[S_non_x_mask_chunk]
+
+                    score = self.calculate_alignment_score(ppm_chunk, S_one_hot_chunk)
+
+                    if score > max_score:
+                        max_score = score
+                        opt_ppm_starts = [ppm_start]
+                        opt_S_starts = [S_start]
+                        opt_overlap_lens = [overlap_len]
+                    elif score == max_score:
+                        opt_ppm_starts.append(ppm_start)
+                        opt_S_starts.append(S_start)
+                        opt_overlap_lens.append(overlap_len)
+
+        return max_score, opt_ppm_starts, opt_S_starts, opt_overlap_lens
+
+    def align_ppms(self, ppms, S, chain_labels, protein_mask, dna_mask, rna_mask):
+        """
+        Given a list of ppms (L x 4), a polymer sequence, the polymer chain
+        labels, and a mask of which specifies which residues are protein
+        residues, align each ppm against every chain of S, recording the best
+        alignments in an aligned ppm.
+
+        Arguments:
+            ppms ((np.float64 np.ndarray, str) List): a list of ppms 
+                (L x 4 arrays) containing the probabilities of DA, DC, DG, DT 
+                for DNA and A, C, G, U for RNA, and an associated string
+                indicating the ppm type ("dna" or "rna").
+            S (np.int32 np.ndarray): an L length array representing the
+                sequence tokens.
+            chain_labels (np.int32 np.ndarray): an L length array containing
+                the chain label of every residue.
+            protein_mask (np.int32 np.ndarray): an L length array that is
+                1 if the residue is a protein residue and 0 otherwise.
+            dna_mask (np.int32 np.ndarray): an L length array that is
+                1 if the residue is a DNA residue and 0 otherwise.
+            rna_mask (np.int32 np.ndarray): an L length array that is
+                1 if the residue is a RNA residue and 0 otherwise.
+        
+        Returns:
+            aligned_ppm (np.float64 np.ndarray): an 
+                (L x len(self.restype_to_int) array, containing the ppm
+                information aligned to the sequence. 
+            ppm_mask (np.int32 np.ndarray): an L length array that is 1 if
+                ppm information has been aligned for the residue and 0 
+                otherwise.
+        """
+        aligned_ppm = np.zeros((S.shape[0], len(self.restype_to_int)), dtype = np.float64)
+        ppm_mask = np.zeros_like(S, dtype = np.int32)
+
+        # Create a one-hot vector from the sequence.
+        S_len = S.shape[0]
+        S_one_hot = np.zeros((S_len, len(self.restype_to_int)), dtype = np.float64)
+        S_one_hot[np.arange(S_len), S] = 1
+        
+        # For each ppm, align against every chain, and record the best
+        # alignments.
+        unique_chains = np.unique(chain_labels)
+        for (ppm, ppm_type) in ppms:
+            max_score = -1 * np.inf
+            opt_ppm_starts = []
+            opt_S_starts = []
+            opt_overlap_lens = []
+
+            # Extract the appropriate nucleic acid columns from the one-hot 
+            # sequence.
+            if ppm_type == "dna":
+                na_restype_ints_to_compare = [self.restype_to_int["DA"], 
+                                              self.restype_to_int["DC"], 
+                                              self.restype_to_int["DG"],
+                                              self.restype_to_int["DT"]]
+            elif ppm_type == "rna":
+                na_restype_ints_to_compare = [self.restype_to_int["A"], 
+                                              self.restype_to_int["C"], 
+                                              self.restype_to_int["G"],
+                                              self.restype_to_int["U"]]
+            S_one_hot_na = S_one_hot[:, na_restype_ints_to_compare]  
+            
+            # Create a mask where the nucleic acid columns are not all zero.
+            S_non_x_mask = np.sum(S_one_hot_na, axis = -1) > 0
+
+            for chain_label in unique_chains:
+                # Get the sequence and start index for every chain, as well as
+                # the NA one-hot and non-unknown mask subset for the chain.
+                chain_indices = np.where(chain_labels == chain_label)
+                chain_S_start_idx = chain_indices[0][0]
+                chain_S_one_hot_na = S_one_hot_na[chain_indices]
+                chain_S_non_x_mask = S_non_x_mask[chain_indices]
+
+                # Exclude protein chains.
+                if protein_mask[chain_S_start_idx] == 1:
+                    continue
+                # Make sure the PPM type matches the chain type.
+                elif (dna_mask[chain_S_start_idx] == 1) and (ppm_type == "rna"):
+                    continue
+                elif (rna_mask[chain_S_start_idx] == 1) and (ppm_type == "dna"):
+                    continue
+                
+                # Align the ppm against the chain sequence.
+                (chain_max_score, 
+                 chain_opt_ppm_starts, 
+                 chain_opt_S_starts, 
+                 chain_opt_overlap_lens) = self.weighted_align(ppm, chain_S_one_hot_na, chain_S_non_x_mask)
+                
+                # Adjust the sequence start positions to represent the overall
+                # index, not just the index within the chain.
+                chain_opt_S_starts = \
+                    list(map(lambda relative_index: relative_index + chain_S_start_idx, 
+                             chain_opt_S_starts))
+                
+                # If the alignment score is greater than previous scores,
+                # set the optimal alignments to the current ones. If the
+                # alignment score is the same, extend the optimal alignments
+                # with the current ones.
+                if chain_max_score > max_score:
+                    max_score = chain_max_score
+                    opt_ppm_starts = copy.copy(chain_opt_ppm_starts)
+                    opt_S_starts = copy.copy(chain_opt_S_starts)
+                    opt_overlap_lens = copy.copy(chain_opt_overlap_lens)
+                elif chain_max_score == max_score:
+                    opt_ppm_starts.extend(chain_opt_ppm_starts)
+                    opt_S_starts.extend(chain_opt_S_starts)
+                    opt_overlap_lens.extend(chain_opt_overlap_lens)
+
+            # If the max score is greater than the minimum score, write the
+            # optimal alignments into the aligned ppm.
+            if max_score > (-1 * np.inf):
+                for (opt_ppm_start, opt_S_start, opt_overlap_len) in \
+                    zip(opt_ppm_starts, opt_S_starts, opt_overlap_lens):
+                    for shared_idx in range(opt_overlap_len):
+                        ppm_idx = opt_ppm_start + shared_idx
+                        S_idx = opt_S_start + shared_idx
+                        
+                        # If a ppm column has already been written to the
+                        # specified sequence index in the aligned ppm, choose
+                        # the ppm column with the higher score (if the DNA is
+                        # not DX at that position), and higher information
+                        # content otherwise.
+                        if ppm_mask[S_idx] == 0:
+                            aligned_ppm[S_idx, na_restype_ints_to_compare] = ppm[ppm_idx]
+                            ppm_mask[S_idx] = 1
+                        elif ppm_mask[S_idx] == 1:
+                            if S_non_x_mask[S_idx]:
+                                ppm_score = self.calculate_alignment_score(ppm[ppm_idx][None, :], S_one_hot_na[S_idx][None, :])
+                                aligned_ppm_score = self.calculate_alignment_score(aligned_ppm[S_idx, na_restype_ints_to_compare][None, :], S_one_hot_na[S_idx][None, :])
+                                if ppm_score > aligned_ppm_score:
+                                    aligned_ppm[S_idx, na_restype_ints_to_compare] = ppm[ppm_idx]
+                            else:
+                                ppm_col_ic = self.calculate_information_content(ppm[ppm_idx][None, :])
+                                aligned_ppm_col_ic = self.calculate_information_content(aligned_ppm[S_idx, na_restype_ints_to_compare][None, :])
+                                if ppm_col_ic > aligned_ppm_col_ic:
+                                    aligned_ppm[S_idx, na_restype_ints_to_compare] = ppm[ppm_idx]
+        
+        return aligned_ppm, ppm_mask
 
     def load_chains(self, chains):
         #------------------proteins vs not--------------------
@@ -370,7 +935,7 @@ class PDBDataset(torch.utils.data.Dataset):
         
         return macromolecule_chain_dict
 
-    def load_assembly(self, macromolecule_chain_dict, asmb, assembly_id):
+    def load_assembly(self, macromolecule_chain_dict, asmb, assembly_id, ppms):
         X_list = []
         protein_mask_list = []
         dna_mask_list = []
@@ -437,6 +1002,11 @@ class PDBDataset(torch.utils.data.Dataset):
         rna_mask = np.concatenate(rna_mask_list, axis = 0) #[L]
         S = np.concatenate(S_list, axis = 0) #[L]
 
+        # Align ppm to the pre-cropped sequence.
+        aligned_ppm, ppm_mask = self.align_ppms(ppms, S, chain_labels, 
+                                                protein_mask, dna_mask, 
+                                                rna_mask)
+
         R_polymer_type = protein_mask * self.polytype_to_int["PP"] + \
                     dna_mask * self.polytype_to_int["DNA"] + \
                     rna_mask * self.polytype_to_int["RNA"] + \
@@ -502,6 +1072,9 @@ class PDBDataset(torch.utils.data.Dataset):
         out_dict["chain_labels"] = chain_labels[mask_for_output]
         out_dict["R_polymer_type"] = R_polymer_type[mask_for_output]
 
+        out_dict["aligned_ppm"] = aligned_ppm[mask_for_output]
+        out_dict["ppm_mask"] = ppm_mask[mask_for_output]
+
         return out_dict
 
     def load_preprocessed_data(self, out_dict, example_dict, assembly_id):
@@ -535,27 +1108,31 @@ class PDBDataset(torch.utils.data.Dataset):
                 canonical base pairing partner for residues that are marked in
                 the canonical_base_pair_mask.
         """
-        out_dict["interface_mask"] = \
-            np.load(example_dict["asmb_interface_masks_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int32)
-        out_dict["side_chain_interface_mask"] = \
-            np.load(example_dict["asmb_side_chain_interface_masks_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int32)
-        out_dict["nearest_protein_side_chain_index"] = \
-            np.load(example_dict["asmb_nearest_protein_side_chain_index_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int64)
-        out_dict["base_pair_mask"] = \
-            np.load(example_dict["asmb_base_pair_masks_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int32)
-        out_dict["base_pair_index"] = \
-            np.load(example_dict["asmb_base_pair_index_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int64)
-        out_dict["canonical_base_pair_mask"] = \
-            np.load(example_dict["asmb_canonical_base_pair_masks_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int32)
-        out_dict["canonical_base_pair_index"] = \
-            np.load(example_dict["asmb_canonical_base_pair_index_path"], 
-                    allow_pickle = True).item()[assembly_id].astype(np.int64)
+        L = out_dict["macromolecule_L"]
+        
+        # Helper function to safely load preprocessed data or use defaults
+        def load_or_default(key, default_dtype, default_value=0):
+            if key in example_dict and pd.notna(example_dict.get(key)):
+                try:
+                    return np.load(example_dict[key], allow_pickle=True).item()[assembly_id].astype(default_dtype)
+                except Exception:
+                    pass
+            return np.full(L, default_value, dtype=default_dtype)
+        
+        out_dict["interface_mask"] = load_or_default(
+            "asmb_interface_masks_path", np.int32, 0)
+        out_dict["side_chain_interface_mask"] = load_or_default(
+            "asmb_side_chain_interface_masks_path", np.int32, 0)
+        out_dict["nearest_protein_side_chain_index"] = load_or_default(
+            "asmb_nearest_protein_side_chain_index_path", np.int64, 0)
+        out_dict["base_pair_mask"] = load_or_default(
+            "asmb_base_pair_masks_path", np.int32, 0)
+        out_dict["base_pair_index"] = load_or_default(
+            "asmb_base_pair_index_path", np.int64, 0)
+        out_dict["canonical_base_pair_mask"] = load_or_default(
+            "asmb_canonical_base_pair_masks_path", np.int32, 0)
+        out_dict["canonical_base_pair_index"] = load_or_default(
+            "asmb_canonical_base_pair_index_path", np.int64, 0)
 
     def apply_crop_mask(self, out_dict, mask_to_keep):
         """
@@ -671,11 +1248,269 @@ class PDBDataset(torch.utils.data.Dataset):
         mask_to_keep[idx_to_keep] = True
         self.apply_crop_mask(out_dict, mask_to_keep)
 
+    def uniformize_ppm_at_masked_positions(self, out_dict, mask_to_uniformize):
+        """
+        Given a dictionary containing the loaded information of a biomolecule,
+        at the positions specified by mask_to_unformize, write 1 in the ppm_mask 
+        and overwrite the ppm to be uniform across DA, DC, DG, DT for DNA or
+        A, C, G, U for RNA.
+
+        Arguments:
+            out_dict (dict): dictionary containing the loaded data for a
+                biomolecule.
+            mask_to_uniformize (bool np.ndarray): a L length array, that is True
+                at nucleic acid positions to be uniformized and False otherwise.
+        
+        Side Effects:
+            out_dict['aligned_ppm']: set to uniform (0.25) across DA, DC, DG, DT 
+                for DNA or A, C, G, U for RNA for the positions indicated by 
+                mask_to_uniformize.
+            out_dict['ppm_mask']: set to 1 for uniformized nucleic acid 
+                resiudes.
+        """
+        # Check that we are only uniformizing the nucleic acid positions.
+        na_mask = np.logical_or(out_dict["dna_mask"] == 1,
+                                out_dict["rna_mask"] == 1)
+        assert(np.all(na_mask[mask_to_uniformize]))
+
+        # Duplicate the aligned ppm and ppm mask.
+        aligned_ppm = out_dict["aligned_ppm"].copy()
+        ppm_mask = out_dict["ppm_mask"].copy()
+
+        # Zero out and uniformize the aligned ppm at the specified positions.
+        aligned_ppm[mask_to_uniformize] = 0
+
+        # Set the DNA positions to uniform.
+        mask_to_uniformize_dna = np.logical_and(mask_to_uniformize, out_dict["dna_mask"] == 1)
+        aligned_ppm[mask_to_uniformize_dna, self.restype_to_int["DA"]] = 0.25
+        aligned_ppm[mask_to_uniformize_dna, self.restype_to_int["DC"]] = 0.25
+        aligned_ppm[mask_to_uniformize_dna, self.restype_to_int["DG"]] = 0.25
+        aligned_ppm[mask_to_uniformize_dna, self.restype_to_int["DT"]] = 0.25
+
+        # Set the RNA positions to uniform.
+        mask_to_uniformize_rna = np.logical_and(mask_to_uniformize, out_dict["rna_mask"] == 1)
+        aligned_ppm[mask_to_uniformize_rna, self.restype_to_int["A"]] = 0.25
+        aligned_ppm[mask_to_uniformize_rna, self.restype_to_int["C"]] = 0.25
+        aligned_ppm[mask_to_uniformize_rna, self.restype_to_int["G"]] = 0.25
+        aligned_ppm[mask_to_uniformize_rna, self.restype_to_int["U"]] = 0.25
+
+        # Set these positions as ppm positions.
+        ppm_mask[mask_to_uniformize] = 1
+
+        # Save the new aligned ppm and ppm mask.
+        out_dict["aligned_ppm"] = aligned_ppm
+        out_dict["ppm_mask"] = ppm_mask
+
+    def uniformize_ppm_all_nucleic_acid(self, out_dict):
+        """
+        Given a dictionary containing the loaded information of a biomolecule,
+        for all nucleic acid residues, write 1 in the ppm_mask and overwrite
+        the ppm to be uniform across DA, DC, DG, DT for DNA or A, C, G, U for 
+        RNA.
+
+        Arguments:
+            out_dict (dict): dictionary containing the loaded data for a
+                biomolecule.
+        
+        Side Effects:
+            out_dict['aligned_ppm']: set to uniform (0.25) across DA, DC, DG, DT 
+                for DNA or A, C, G, U for RNA for any nucleic acid residues.
+            out_dict['ppm_mask']: set to 1 for all nucleic acid residues.
+        """
+        na_mask = np.logical_or(out_dict["dna_mask"] == 1,
+                                out_dict["rna_mask"] == 1)
+        
+        self.uniformize_ppm_at_masked_positions(out_dict, na_mask)
+
+    def uniformize_ppm_at_non_side_chain_interface(self, out_dict):
+        """
+        Given a dictionary containing the loaded information of a biomolecule,
+        for all nucleic acid residues that do not have ppm information and are
+        not located at the side chain interface, change the ppm to be uniform.
+
+        Arguments:
+            out_dict (dict): dictionary containing the loaded data for a
+                biomolecule.
+        
+        Side Effects:
+            out_dict['aligned_ppm']: set to uniform (0.25) across across 
+                DA, DC, DG, DT for DNA or A, C, G, U for RNA for any nucleic 
+                acid residues without ppm information and not at the side chain 
+                interface.
+            out_dict['ppm_mask']: set to 1 for these residues.
+
+        """
+        na_mask = np.logical_or(out_dict["dna_mask"] == 1,
+                                out_dict["rna_mask"] == 1)
+        not_ppm_mask = np.logical_not(out_dict["ppm_mask"] == 1)
+        not_side_chain_interface_mask = np.logical_not(out_dict["side_chain_interface_mask"] == 1)
+
+        mask_to_uniformize = np.logical_and.reduce((na_mask, not_ppm_mask, not_side_chain_interface_mask))
+        
+        self.uniformize_ppm_at_masked_positions(out_dict, mask_to_uniformize)
+
+    def mutate_interface_at_masked_positions(self, out_dict, mask_to_mutate):
+        """
+        Given a dictionary containing the loaded information of a biomolecule,
+        and a mask indicating which protein side chain interface residues to 
+        mutate, mutate the selected protein residues to a different sequence 
+        identity and uniformize the ppm of any nucleic acid residues that were 
+        closest to the mutated protein residues.
+
+        Arguments:
+            out_dict (dict): dictionary containing the loaded data for a
+                biomolecule.
+            mask_to_mutate (bool np.ndarray): a L length array, that is True
+                at protein side chain interface positions to be mutated and
+                False otherwise.
+
+        Side Effects:
+            out_dict["S"]: randomly mutate to a different protein residue for
+                the protein side chain interface residues specified in the 
+                mask_to_mutate.
+            out_dict['aligned_ppm']: set to uniform (0.25) across the
+                appropriate residue types for the nucleic acid side chain 
+                interface residues whose nearest protein side chain residue was 
+                mutated.
+            out_dict['ppm_mask']: set to 1 for the nucleic acid residues whose
+                ppm was uniformized.
+        """
+        # Check that the residues to mutate are all protein side chain interface
+        # residues.
+        protein_side_chain_interface_mask = \
+            np.logical_and(out_dict["protein_mask"] == 1, 
+                           out_dict["side_chain_interface_mask"] == 1)
+        assert(np.all(protein_side_chain_interface_mask[mask_to_mutate]))
+
+        # Compute the nucleic acid side chain interface mask, for use in
+        # selected the contacting nucleic acid residues.
+        na_mask = np.logical_or(out_dict["dna_mask"] == 1,
+                                out_dict["rna_mask"] == 1)
+        na_side_chain_interface_mask = \
+            np.logical_and(na_mask, 
+                           out_dict["side_chain_interface_mask"] == 1)
+    
+        # For each protein residue to be mutated, mutate the residue and
+        # uniformize contacting nucleic acid residue ppms.
+        for protein_res_i in np.where(mask_to_mutate)[0]:
+            contacting_na_residues = \
+                list(np.where(np.logical_and(na_side_chain_interface_mask,
+                                             out_dict["nearest_protein_side_chain_index"] == protein_res_i))[0])
+            
+            if self.mutate_base_pair_together:
+                contacting_na_base_pair_residues = []
+                for na_res_j in contacting_na_residues:
+                    if out_dict["base_pair_mask"][na_res_j] == 1:
+                        contacting_na_base_pair_residues.append(out_dict["base_pair_index"][na_res_j])
+                contacting_na_residues = list(set(contacting_na_residues + contacting_na_base_pair_residues))
+
+            if len(contacting_na_residues) > 0:
+                # Mutate the protein residue.
+                out_dict["S"][protein_res_i] = \
+                    np.random.choice([res_int for res_int in self.protein_restype_ints if (res_int != out_dict["S"][protein_res_i] and res_int != self.restype_to_int["UNK"])])
+
+                # Uniformize the PPM.
+                for na_res_j in contacting_na_residues:
+                    if out_dict["dna_mask"][na_res_j] == 1:
+                        out_dict["aligned_ppm"][na_res_j, 
+                                                [self.restype_to_int["DA"], 
+                                                self.restype_to_int["DC"], 
+                                                self.restype_to_int["DG"], 
+                                                self.restype_to_int["DT"]]] = 0.25
+                    elif out_dict["rna_mask"][na_res_j] == 1:
+                        out_dict["aligned_ppm"][na_res_j, 
+                                                [self.restype_to_int["A"], 
+                                                self.restype_to_int["C"], 
+                                                self.restype_to_int["G"], 
+                                                self.restype_to_int["U"]]] = 0.25
+
+                    out_dict["ppm_mask"][na_res_j] = 1
+
+    def mutate_entire_side_chain_interface(self, out_dict):
+        """
+        Given a dictionary containing the loaded information of a biomolecule,
+        with a probability dictated by 
+        self.mutate_entire_side_chain_interface_probability, mutate all protein 
+        side chain residues to a different sequence identity and uniformize the 
+        ppm of all nucleic acid residues.
+
+        Arguments:
+            out_dict (dict): dictionary containing the loaded data for a
+                biomolecule.
+
+        Side Effects:
+            out_dict["S"]: randomly mutate to a different protein residue for
+                all protein side chain interface residues.
+            out_dict['aligned_ppm']: set to uniform (0.25) across the
+                appropriate residue types for all nucleic acid residues.
+            out_dict['ppm_mask']: set to 1 for the nucleic acid residues whose
+                ppm was uniformized.
+        """
+        if sample_bernoulli_rv(self.mutate_entire_side_chain_interface_probability) == 1:
+            protein_side_chain_interface_mask = \
+                np.logical_and(out_dict["protein_mask"] == 1, 
+                               out_dict["side_chain_interface_mask"] == 1)
+
+            # Mutate the protein residues.
+            self.mutate_interface_at_masked_positions(out_dict, protein_side_chain_interface_mask)
+
+            # Ensure all nucleic acids are uniformized.
+            self.uniformize_ppm_all_nucleic_acid(out_dict)
+
+    def mutate_random_side_chain_interface(self, out_dict):
+        """
+        Given a dictionary containing the loaded information of a biomolecule,
+        mutate all protein side chain residues randomly, with a per-residue
+        probability dictated by 
+        self.protein_interface_residue_mutation_probability, to a different 
+        sequence identity and uniformize the ppm of any nucleic acid residues 
+        that were closest to the mutated protein residues.
+
+        Arguments:
+            out_dict (dict): dictionary containing the loaded data for a
+                biomolecule.
+
+        Side Effects:
+            out_dict["S"]: randomly mutate to a different protein residue for
+                the randomly selected protein side chain interface residues.
+            out_dict['aligned_ppm']: set to uniform (0.25) across the
+                appropriate residue types for the nucleic acid side chain 
+                interface residues whose nearest protein side chain residue was 
+                mutated.
+            out_dict['ppm_mask']: set to 1 for the nucleic acid residues whose
+                ppm was uniformized.
+        """
+        protein_side_chain_interface_mask = \
+            np.logical_and(out_dict["protein_mask"] == 1, 
+                           out_dict["side_chain_interface_mask"] == 1)
+        
+        per_residue_bernoulli_rvs = sample_bernoulli_rvs(p = self.protein_interface_residue_mutation_probability,
+                                                         n = out_dict["macromolecule_L"])
+        per_residue_mutation_mask = (per_residue_bernoulli_rvs == 1)
+
+        interface_protein_residue_mutation_mask = \
+            np.logical_and(per_residue_mutation_mask, 
+                           protein_side_chain_interface_mask)
+
+        self.mutate_interface_at_masked_positions(out_dict, interface_protein_residue_mutation_mask)
+
     def loader(self, example_dict, assembly_id):
         try:
             chains, asmb, covalei, meta = self.parse_structure(example_dict["structure_path"])
         except:
             print('bad_structure: ', example_dict["structure_path"])
+            return ("pass", "pass")
+        
+        try:
+            if self.parse_ppms:
+                ppms, ppm_paths_chosen = self.load_ppms(example_dict["ppm_paths"], 
+                                                        randomize_experimental_ppms = True,
+                                                        ppm_base_dir = example_dict.get("dataset_root"))
+            else:
+                ppms, ppm_paths_chosen = self.load_ppms("[]", 
+                                                        randomize_experimental_ppms = True)
+        except:
+            print('bad_ppms: ', example_dict["structure_path"], example_dict["ppm_paths"])
             return ("pass", "pass")
         
         if assembly_id not in list(asmb.keys()):
@@ -684,7 +1519,7 @@ class PDBDataset(torch.utils.data.Dataset):
 
         macromolecule_chain_dict = self.load_chains(chains)
 
-        out_dict = self.load_assembly(macromolecule_chain_dict, asmb, assembly_id)
+        out_dict = self.load_assembly(macromolecule_chain_dict, asmb, assembly_id, ppms)
 
         self.load_preprocessed_data(out_dict, example_dict, assembly_id)
 
@@ -692,12 +1527,32 @@ class PDBDataset(torch.utils.data.Dataset):
         if self.drop_protein_probability > 0 and out_dict["macromolecule_L"] > out_dict["protein_L"]:
             self.drop_protein(out_dict)
 
+        # Uniformize the ppms of free nucleic acid.
+        if self.na_only_as_uniform_ppm and out_dict["protein_L"] == 0:
+            self.uniformize_ppm_all_nucleic_acid(out_dict)
+        
+        # Uniformize the ppms of non side chain interface positions.
+        if self.na_non_interface_as_uniform_ppm:
+            self.uniformize_ppm_at_non_side_chain_interface(out_dict)
+
+        # Randomly mutate side chain interface protein residues and modify the
+        # contacting ppm positions to be uniform.
+        if self.protein_interface_residue_mutation_probability > 0 and out_dict["protein_L"] > 0:
+            self.mutate_random_side_chain_interface(out_dict)
+
+        # Mutate all side chain interface protein residues and modify the
+        # contacting ppm positions to be uniform.
+        if self.mutate_entire_side_chain_interface_probability > 0 and out_dict["protein_L"] > 0:
+            self.mutate_entire_side_chain_interface(out_dict)
+
         # Crop structures that are larger than the number of tokens in a batch.
         if self.crop_large_structures and out_dict["macromolecule_L"] > self.batch_tokens:
             self.random_crop_na(out_dict)
         
         out_dict["structure_path"] = example_dict["structure_path"]
         out_dict["assembly_id"] = assembly_id
+        out_dict["ppm_paths"] = example_dict["ppm_paths"]
+        out_dict["ppm_paths_chosen"] = ppm_paths_chosen
 
         return (out_dict, out_dict["macromolecule_L"])
     
@@ -707,6 +1562,9 @@ class PDBDataset(torch.utils.data.Dataset):
         except:
             print('bad_structure: ', example_dict["structure_path"])
             return ("pass", "pass")
+
+        # PPMs are not necessary for structure preprocessing.
+        ppms = []
 
         # Save the per-chain sequences, for clustering purposes.
         chain_sequences = []
@@ -718,7 +1576,7 @@ class PDBDataset(torch.utils.data.Dataset):
 
         assemblies = []
         for assembly_id in list(asmb.keys()):
-            out_dict = self.load_assembly(macromolecule_chain_dict, asmb, assembly_id)
+            out_dict = self.load_assembly(macromolecule_chain_dict, asmb, assembly_id, ppms)
             assemblies.append((assembly_id, out_dict))
         
         return assemblies, chain_sequences
@@ -792,18 +1650,31 @@ def make_batch_iter(df, batch_tokens, length_cutoff, date_cutoff, crop_large_str
     L_list = []
     name_list = []
     for example_dict in samples:
-        # Assembly ID to length dictionary.
-        asmb_lengths_dict = np.load(example_dict["asmb_lengths_path"], allow_pickle = True).item()
-        assembly_id_list = list(asmb_lengths_dict.keys())
+        # Check if preprocessed data exists
+        if "asmb_lengths_path" in example_dict and pd.notna(example_dict.get("asmb_lengths_path")):
+            # Use preprocessed assembly lengths
+            try:
+                asmb_lengths_dict = np.load(example_dict["asmb_lengths_path"], allow_pickle = True).item()
+                assembly_id_list = list(asmb_lengths_dict.keys())
 
-        num_assemblies = len(assembly_id_list)
-        if num_assemblies > 1:
-            idx = np.random.randint(0, high = num_assemblies, dtype = int)
+                num_assemblies = len(assembly_id_list)
+                if num_assemblies > 1:
+                    idx = np.random.randint(0, high = num_assemblies, dtype = int)
+                else:
+                    idx = 0
+                assembly_id = assembly_id_list[idx]
+
+                (macromolecule_L, protein_L, dna_L, rna_L) = asmb_lengths_dict[assembly_id]
+            except Exception:
+                # Fallback: use default assembly and estimate length
+                assembly_id = "1"
+                macromolecule_L = batch_tokens  # Will be determined at load time
+                dna_L, rna_L = 1, 0  # Assume has NA
         else:
-            idx = 0
-        assembly_id = assembly_id_list[idx]
-
-        (macromolecule_L, protein_L, dna_L, rna_L) = asmb_lengths_dict[assembly_id]
+            # No preprocessed data: use default assembly and estimate length
+            assembly_id = "1"
+            macromolecule_L = batch_tokens  # Will be determined at load time
+            dna_L, rna_L = 1, 0  # Assume has NA
 
         if macromolecule_L >= length_cutoff and len(L_list) < max_number_of_pdbs:
             if macromolecule_L > batch_tokens and crop_large_structures and (dna_L + rna_L) > 0:
