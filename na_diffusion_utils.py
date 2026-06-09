@@ -197,6 +197,7 @@ def compute_diffusion_loss(
     valid_mask: Optional[torch.Tensor] = None,
     position_weights: Optional[torch.Tensor] = None,
     loss_weight_strategy: str = "balanced",
+    loss_weight_epsilon: float = 0.1,
     label_smoothing: float = 0.0,
     na_restype_mask: Optional[torch.Tensor] = None,
     polymer_masks: Optional[dict] = None,
@@ -215,6 +216,7 @@ def compute_diffusion_loss(
         valid_mask: [B, L] Valid sequence positions
         position_weights: [B, L] Optional per-position loss multipliers
         loss_weight_strategy: Strategy for loss weighting
+        loss_weight_epsilon: Small constant for loss weighting stability
         label_smoothing: Label smoothing factor
         na_restype_mask: [V] mask for valid NA tokens (for label smoothing)
         polymer_masks: Optional position masks for protein, DNA, and RNA tokens
@@ -285,7 +287,11 @@ def compute_diffusion_loss(
     per_sample_loss = masked_loss.sum(dim=1) / num_masked
     
     # Apply DPLM-style loss weighting
-    loss_weight = compute_loss_weight(mask_ratio, strategy=loss_weight_strategy)
+    loss_weight = compute_loss_weight(
+        mask_ratio,
+        strategy=loss_weight_strategy,
+        epsilon=loss_weight_epsilon,
+    )
     if loss_weight.dim() == 0:
         loss_weight = loss_weight.unsqueeze(0).expand(B)
     

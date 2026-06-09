@@ -2119,7 +2119,7 @@ def run_na_mpnn_sequence(structure_path,
                 "name": f"{structure_name}_{design_id}",
                 "design_sequence": fasta_sequence,
                 "tool_reported_sequence_recovery": np.nan,
-                "design_method": "na_mpnn_diffusion",
+                "design_method": "naiad",
                 "model_weights_path": na_mpnn_model_path,
                 "model_config_path": na_mpnn_config_path
             }
@@ -2601,7 +2601,7 @@ def extract_na_sequence_data_from_design_sequence(design_sequence,
 
     chain_sequences = design_sequence.split(NAConstants.chain_break_character)
 
-    if design_method == "na_mpnn":
+    if design_method in ("naiad", "na_mpnn"):
         na_sequence_data = []
         for chain_sequence in chain_sequences:
             if len(chain_sequence) == 0:
@@ -3446,7 +3446,7 @@ def design_nucleic_acid_sequence(structure_path,
                                  overall_output_directory,
                                  num_samples,
                                  temperature,
-                                 method = "na_mpnn",
+                                 method = "naiad",
                                  na_mpnn_model_path = None,
                                  na_mpnn_config_path = None,
                                  with_protein = True):
@@ -3457,18 +3457,19 @@ def design_nucleic_acid_sequence(structure_path,
     created for each design, containing the design ID, name, designed nucleic
     acid sequence data, protein sequences (from native), and metadata.
 
-    Only NA-MPNN supports DNA design and design in protein context.
+    Only NAIAD supports DNA design and design in protein context.
 
     Args:
         structure_path (str): The path to the structure file.
         overall_output_directory (str): The path to the overall output directory.
         num_samples (int): The number of samples to generate.
         temperature (float): The temperature for the sequence design algorithm.
-        method (str): The sequence design method to use. Options are "na_mpnn",
-            "grnade", "ridiffusion", and "rhodesign". Default is "na_mpnn".
-        na_mpnn_model_path (str): The path to the NA-MPNN model file. Required
-            if method is "na_mpnn".
-        na_mpnn_config_path (str): The path to the NA-MPNN diffusion config.
+        method (str): The sequence design method to use. Options are "naiad",
+            "na_mpnn" (legacy alias), "grnade", "ridiffusion", and
+            "rhodesign". Default is "naiad".
+        na_mpnn_model_path (str): The path to the NAIAD model file. Required
+            if method is "naiad" or the legacy "na_mpnn" alias.
+        na_mpnn_config_path (str): The path to the NAIAD diffusion config.
         with_protein (bool): Whether to include protein chains as structural
             context during design. If False and the structure contains protein,
             protein chains are removed before design. Default is True.
@@ -3542,12 +3543,17 @@ def design_nucleic_acid_sequence(structure_path,
     has_dna = complex_sequence_data["has_dna"]
 
     # Check method compatibility with DNA and protein context.
-    if method != "na_mpnn" and has_dna:
+    if method is None:
+        method = "naiad"
+    if method == "na_mpnn":
+        method = "naiad"
+
+    if method != "naiad" and has_dna:
         raise ValueError(
             f"Method '{method}' does not support DNA design. "
             f"Structure '{structure_name}' contains DNA chains."
         )
-    if method != "na_mpnn" and has_protein and with_protein:
+    if method != "naiad" and has_protein and with_protein:
         raise ValueError(
             f"Method '{method}' does not support design in protein context."
         )
@@ -3574,8 +3580,8 @@ def design_nucleic_acid_sequence(structure_path,
     os.makedirs(design_json_output_directory)
 
     try:
-        if method == "na_mpnn":
-            # Run NA-MPNN sequence design.
+        if method == "naiad":
+            # Run NAIAD diffusion sequence design.
             design_data = run_na_mpnn_sequence(
                 design_structure_path,
                 output_directory = output_directory,
@@ -4309,7 +4315,8 @@ if __name__ == "__main__":
     argument_parser.add_argument(
         "--method", 
         type = str,
-        help = "The method to use."
+        help = "The method to use.",
+        default = "naiad"
     )
     argument_parser.add_argument(
         "--na_mpnn_model_path", 

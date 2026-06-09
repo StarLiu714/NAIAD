@@ -242,19 +242,60 @@ def load_structure(pdb_path: str, pdb_dataset: PDBDataset, device: torch.device)
 def sequence_to_string(
     seq_tensor: torch.Tensor, 
     pdb_dataset: PDBDataset,
-    mask: Optional[torch.Tensor] = None
+    mask: Optional[torch.Tensor] = None,
+    dna_mask: Optional[torch.Tensor] = None,
+    rna_mask: Optional[torch.Tensor] = None,
+    chain_labels: Optional[torch.Tensor] = None,
+    chain_break_character: str = "/",
 ) -> str:
     """Convert sequence tensor to string representation."""
     seq = seq_tensor.cpu().numpy()
     if mask is not None:
         mask = mask.cpu().numpy()
+    if dna_mask is not None:
+        dna_mask = dna_mask.cpu().numpy()
+    if rna_mask is not None:
+        rna_mask = rna_mask.cpu().numpy()
+    if chain_labels is not None:
+        chain_labels = chain_labels.cpu().numpy()
+
+    dna_chars_by_restype = {
+        "DA": "a", "A": "a",
+        "DC": "c", "C": "c",
+        "DG": "g", "G": "g",
+        "DT": "t", "U": "t",
+        "DX": "x", "RX": "x",
+    }
+    rna_chars_by_restype = {
+        "DA": "b", "A": "b",
+        "DC": "d", "C": "d",
+        "DG": "h", "G": "h",
+        "DT": "u", "U": "u",
+        "DX": "y", "RX": "y",
+    }
     
     result = []
+    previous_chain_label = None
     for i, token_idx in enumerate(seq):
         if mask is not None and mask[i] == 0:
             continue
         restype = pdb_dataset.int_to_restype.get(token_idx, 'X')
-        char = pdb_dataset.restype_3_to_1.get(restype, 'X')
+        if rna_mask is not None and rna_mask[i] > 0:
+            char = rna_chars_by_restype.get(restype, 'X')
+        elif dna_mask is not None and dna_mask[i] > 0:
+            char = dna_chars_by_restype.get(restype, 'X')
+        else:
+            char = pdb_dataset.restype_3_to_1.get(restype, 'X')
+
+        if chain_labels is not None:
+            chain_label = chain_labels[i]
+            if (
+                previous_chain_label is not None and
+                chain_label != previous_chain_label
+            ):
+                result.append(chain_break_character)
+            previous_chain_label = chain_label
+
         result.append(char)
     
     return ''.join(result)
@@ -338,10 +379,20 @@ def sample_sequences(
         if mask_na_only:
             seq_str = sequence_to_string(
                 final_seq[0], pdb_dataset, 
-                mask=(feature_dict["dna_mask"][0] + feature_dict["rna_mask"][0])
+                mask=(feature_dict["dna_mask"][0] + feature_dict["rna_mask"][0]),
+                dna_mask=feature_dict["dna_mask"][0],
+                rna_mask=feature_dict["rna_mask"][0],
+                chain_labels=feature_dict["chain_labels"][0],
             )
         else:
-            seq_str = sequence_to_string(final_seq[0], pdb_dataset, feature_dict["mask"][0])
+            seq_str = sequence_to_string(
+                final_seq[0],
+                pdb_dataset,
+                feature_dict["mask"][0],
+                dna_mask=feature_dict["dna_mask"][0],
+                rna_mask=feature_dict["rna_mask"][0],
+                chain_labels=feature_dict["chain_labels"][0],
+            )
         
         results.append((seq_str, final_seq, trajectory))
         
@@ -449,7 +500,10 @@ def main():
     # Get original NA sequence for comparison
     original_seq = sequence_to_string(
         feature_dict["S"][0], pdb_dataset,
-        mask=(feature_dict["dna_mask"][0] + feature_dict["rna_mask"][0])
+        mask=(feature_dict["dna_mask"][0] + feature_dict["rna_mask"][0]),
+        dna_mask=feature_dict["dna_mask"][0],
+        rna_mask=feature_dict["rna_mask"][0],
+        chain_labels=feature_dict["chain_labels"][0],
     )
     print(f"\nOriginal NA sequence: {original_seq}")
     

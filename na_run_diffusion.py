@@ -738,6 +738,7 @@ def main():
                         valid_mask=mask_for_loss,
                         position_weights=position_loss_weights,
                         loss_weight_strategy=params["LOSS_WEIGHT_STRATEGY"],
+                        loss_weight_epsilon=params["LOSS_WEIGHT_EPSILON"],
                         label_smoothing=params["DIFFUSION_LABEL_SMOOTHING"],
                         na_restype_mask=na_restype_mask,
                         polymer_masks=polymer_masks,
@@ -783,6 +784,7 @@ def main():
                     valid_mask=mask_for_loss,
                     position_weights=position_loss_weights,
                     loss_weight_strategy=params["LOSS_WEIGHT_STRATEGY"],
+                    loss_weight_epsilon=params["LOSS_WEIGHT_EPSILON"],
                     label_smoothing=params["DIFFUSION_LABEL_SMOOTHING"],
                     na_restype_mask=na_restype_mask,
                     polymer_masks=polymer_masks,
@@ -1056,6 +1058,7 @@ def main():
             'diffusion_params': {
                 'mask_ratio_schedule': params['MASK_RATIO_SCHEDULE'],
                 'loss_weight_strategy': params['LOSS_WEIGHT_STRATEGY'],
+                'loss_weight_epsilon': params['LOSS_WEIGHT_EPSILON'],
                 'use_irm_penalty': params['USE_IRM_PENALTY'],
                 'irm_penalty_weight': params['IRM_PENALTY_WEIGHT'],
                 'irm_min_tokens_per_env': params['IRM_MIN_TOKENS_PER_ENV'],
@@ -1098,6 +1101,7 @@ def main():
                 'diffusion_params': {
                     'mask_ratio_schedule': params['MASK_RATIO_SCHEDULE'],
                     'loss_weight_strategy': params['LOSS_WEIGHT_STRATEGY'],
+                    'loss_weight_epsilon': params['LOSS_WEIGHT_EPSILON'],
                     'use_irm_penalty': params['USE_IRM_PENALTY'],
                     'irm_penalty_weight': params['IRM_PENALTY_WEIGHT'],
                     'irm_min_tokens_per_env': params['IRM_MIN_TOKENS_PER_ENV'],

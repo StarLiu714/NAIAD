@@ -1502,15 +1502,16 @@ class PDBDataset(torch.utils.data.Dataset):
             return ("pass", "pass")
         
         try:
+            ppm_paths = example_dict.get("ppm_paths", "[]")
             if self.parse_ppms:
-                ppms, ppm_paths_chosen = self.load_ppms(example_dict["ppm_paths"], 
+                ppms, ppm_paths_chosen = self.load_ppms(ppm_paths,
                                                         randomize_experimental_ppms = True,
                                                         ppm_base_dir = example_dict.get("dataset_root"))
             else:
                 ppms, ppm_paths_chosen = self.load_ppms("[]", 
                                                         randomize_experimental_ppms = True)
         except:
-            print('bad_ppms: ', example_dict["structure_path"], example_dict["ppm_paths"])
+            print('bad_ppms: ', example_dict["structure_path"], ppm_paths)
             return ("pass", "pass")
         
         if assembly_id not in list(asmb.keys()):
@@ -1551,7 +1552,7 @@ class PDBDataset(torch.utils.data.Dataset):
         
         out_dict["structure_path"] = example_dict["structure_path"]
         out_dict["assembly_id"] = assembly_id
-        out_dict["ppm_paths"] = example_dict["ppm_paths"]
+        out_dict["ppm_paths"] = ppm_paths
         out_dict["ppm_paths_chosen"] = ppm_paths_chosen
 
         return (out_dict, out_dict["macromolecule_L"])
