@@ -3,6 +3,8 @@
 ################################################################################
 # Python Standard Libraries
 import argparse
+import ast
+import copy
 import gzip
 import hashlib
 import json
@@ -16,6 +18,8 @@ import tempfile
 
 # Third-Party Libraries
 import numpy as np
+import pandas as pd
+
 import biotite
 import biotite.structure
 
@@ -23,6 +27,36 @@ import atomworks
 import atomworks.io.utils.io_utils
 from atomworks.enums import ChainType
 from atomworks.ml.utils.token import get_token_starts
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+DEFAULT_CONTAINER_DIR = pathlib.Path(os.environ.get("NAIAD_CONTAINER_DIR", "containers"))
+DEFAULT_SOFTWARE_DIR = pathlib.Path(os.environ.get("NAIAD_SOFTWARE_DIR", "software"))
+DEFAULT_RIBONANZA_NET_PATH = str(REPO_ROOT / "evaluation" / "run_ribonanza_net.py")
+DEFAULT_RIBONANZA_NET_APPTAINER_PATH = os.environ.get(
+    "RIBONANZA_NET_APPTAINER_PATH",
+    str(DEFAULT_CONTAINER_DIR / "PPI_design_mpnn.sif")
+)
+DEFAULT_ALPHAFOLD3_APPTAINER_PATH = os.environ.get(
+    "ALPHAFOLD3_APPTAINER_PATH",
+    str(DEFAULT_CONTAINER_DIR / "mlfold3_01.sif")
+)
+DEFAULT_NA_MPNN_RUN_PATH = os.environ.get(
+    "NAIAD_RUN_PATH",
+    str(REPO_ROOT / "inference" / "na_sample_diffusion.py")
+)
+DEFAULT_NA_MPNN_MODEL_PATH = os.environ.get(
+    "NAIAD_MODEL_PATH",
+    str(REPO_ROOT / "models" / "s1836.pt")
+)
+DEFAULT_NA_MPNN_CONFIG_PATH = os.environ.get(
+    "NAIAD_CONFIG_PATH",
+    str(REPO_ROOT / "configs" / "irm_enhanced_diffusion_training.json")
+)
+DEFAULT_RIBONANZA_NET_ROOT = os.environ.get("RIBONANZA_NET_ROOT")
+DEFAULT_OPENKNOT_SCORE_PATH = os.environ.get("OPENKNOT_SCORE_PATH")
+DEFAULT_DSSR_PATH = os.environ.get("DSSR_PATH", "x3dna-dssr")
+DEFAULT_ETERNAFOLD_PATH = os.environ.get("ETERNAFOLD_PATH", "contrafold")
+DEFAULT_US_ALIGN_PATH = os.environ.get("US_ALIGN_PATH", "USalign")
 
 ################################################################################
 # Common Functions
@@ -598,6 +632,21 @@ class NAConstants:
         dna_restype_to_rna_restype["DT"] = "U"
         dna_restype_to_rna_restype["DX"] = "RX"
     
+    # DeepPBS restype ordering.
+    deep_pbs_restypes = [
+        "DA",
+        "DC",
+        "DG",
+        "DT"
+    ]
+
+    # DeepPBS restype to int mapping.
+    deep_pbs_restype_to_int = dict(zip(deep_pbs_restypes, range(len(deep_pbs_restypes))))
+    deep_pbs_int_to_restype = dict(zip(range(len(deep_pbs_restypes)), deep_pbs_restypes))
+
+    # Min overlap length for ppm alignment.
+    min_overlap_length = 5
+
     # 2D structure symbols for RNA.
     pair_symbols_list = [
         ("(", ")"),
@@ -1336,7 +1385,7 @@ def standardize_secondary_structure(secondary_structure,
 # Structure to Sequence and Secondary Structure
 ################################################################################
 def run_dssr(structure_path, 
-             dssr_path = "/projects/ml/afavor/software/dssr-x3dna/x3dna-dssr"):
+             dssr_path = DEFAULT_DSSR_PATH):
     """
     Given a path to a tertiary structure file containing nucleic acid, runs the
     DSSR algorithm to extract the nucleic acid sequence and determine the
@@ -1411,7 +1460,7 @@ def run_dssr(structure_path,
 # Sequence to Predicted Secondary Structure and Reactivity Profile
 ################################################################################
 def run_eternafold(sequence,
-                   eternafold_path = "/projects/ml/afavor/software/EternaFold/src/contrafold"):
+                   eternafold_path = DEFAULT_ETERNAFOLD_PATH):
     """
     Given a sequence, run the EternaFold algorithm to predict the secondary
     structure of the sequence.
@@ -1475,8 +1524,8 @@ def run_eternafold(sequence,
 
 def run_ribonanza_net_reactivity_profile(sequence,
                                          batch_size = 1,
-                                         ribonanza_net_apptainer_path = "/software/containers/users/afavor/PPI_design_mpnn.sif",
-                                         ribonanza_net_path = "/home/akubaney/projects/na_mpnn/evaluation/run_ribonanza_net.py",):
+                                         ribonanza_net_apptainer_path = DEFAULT_RIBONANZA_NET_APPTAINER_PATH,
+                                         ribonanza_net_path = DEFAULT_RIBONANZA_NET_PATH,):
     """
     Given a sequence, runs the RibonanzaNet algorithm to predict the reactivity
     profile of the sequence.
@@ -1546,8 +1595,8 @@ def run_ribonanza_net_reactivity_profile(sequence,
 
 def run_ribonanza_net_secondary_structure(sequence,
                                           batch_size = 1,
-                                          ribonanza_net_apptainer_path = "/software/containers/users/afavor/PPI_design_mpnn.sif",
-                                          ribonanza_net_path = "/home/akubaney/projects/na_mpnn/evaluation/run_ribonanza_net.py"):
+                                          ribonanza_net_apptainer_path = DEFAULT_RIBONANZA_NET_APPTAINER_PATH,
+                                          ribonanza_net_path = DEFAULT_RIBONANZA_NET_PATH):
     """
     Given a sequence, runs the RibonanzaNet algorithm to predict the secondary
     structure of the sequence.
@@ -1687,7 +1736,7 @@ def run_alphafold3(name,
                    precomputed_chain_data = None,
                    buckets = "128,256,512",
                    flash_attention_implementation = "triton",
-                   alphafold3_apptainer_path = "/software/containers/users/ikalvet/mlfold3/mlfold3_01.sif",
+                   alphafold3_apptainer_path = DEFAULT_ALPHAFOLD3_APPTAINER_PATH,
                    alphafold3_path = "/opt/alphafold3/run_alphafold.py",
                    model_dir = "/databases/alphafold",
                    db_dir = "/databases/lab/af3_DB",):
@@ -1936,6 +1985,664 @@ def run_alphafold3(name,
     }
     
     return result
+
+################################################################################
+# Sequence design
+################################################################################
+def run_na_mpnn_sequence(structure_path, 
+                         output_directory = None,
+                         batch_size = 1,
+                         number_of_batches = 1,
+                         temperature = 0.1,
+                         omit_AA = "",
+                         design_na_only = 0,
+                         load_residues_with_missing_atoms = 0,
+                         output_pdbs = 0,
+                         catch_failed_inferences = 1,
+                         na_mpnn_apptainer_path = "/software/containers/mlfold.sif",
+                         na_mpnn_path = DEFAULT_NA_MPNN_RUN_PATH,
+                         na_mpnn_model_path = DEFAULT_NA_MPNN_MODEL_PATH,
+                         na_mpnn_config_path = DEFAULT_NA_MPNN_CONFIG_PATH):
+    """
+    Given a structure path, runs the NA-MPNN sequence design algorithm to
+    generate sequences for the structure. The output is a list of dictionaries
+    containing the design ID, name, design sequence, and tool-reported sequence
+    recovery.
+
+    Args:
+        structure_path (str): The path to the structure file.
+        output_directory (str): The path to the output directory. If not
+            specified, a temporary directory will be created.
+        batch_size (int): The batch size for the NA-MPNN algorithm.
+        number_of_batches (int): The number of batches to run.
+        temperature (float): The temperature for the NA-MPNN algorithm.
+        omit_AA (str): The amino acids to omit from the design.
+        design_na_only (int): Whether to design only nucleic acids.
+        load_residues_with_missing_atoms (int): Whether to load residues with
+            missing atoms.
+        output_pdbs (int): Whether to output PDB files.
+        catch_failed_inferences (int): Whether to catch failed inferences.
+        na_mpnn_apptainer_path (str): The path to the NA-MPNN apptainer.
+        na_mpnn_path (str): The path to the NA-MPNN run file.
+        na_mpnn_model_path (str): The path to the NA-MPNN model file.
+        na_mpnn_config_path (str): The path to the diffusion config JSON.
+    
+    Returns:
+        design_data (dict list): A list of dictionaries containing:
+            input_structure_name (str): The name of the input structure.
+            input_structure_path (str): The path to the input structure.
+            design_id (str): The design ID.
+            name (str): The name of the design.
+            design_sequence (str): The design sequence.
+            tool_reported_sequence_recovery (float): The tool-reported sequence
+                recovery.
+            design_method (str): The design method used.
+            model_weights_path (str): The path to the model weights used.
+    """
+    # Convert the structure path to an absolute path.
+    structure_path = os.path.abspath(structure_path)
+
+    # Check that the structure path exists.
+    if not os.path.exists(structure_path):
+        raise ValueError(f"Structure file not found: {structure_path}")
+
+    if na_mpnn_model_path is None:
+        na_mpnn_model_path = DEFAULT_NA_MPNN_MODEL_PATH
+    if na_mpnn_config_path is None:
+        na_mpnn_config_path = DEFAULT_NA_MPNN_CONFIG_PATH
+
+    # If the output directory is not specified, create a temporary directory.
+    # The temporary directory will be automatically cleaned up when the script
+    # exits.
+    if output_directory is None:
+        tmp_directory = tempfile.TemporaryDirectory()
+        output_directory = tmp_directory.name
+    else:
+        tmp_directory = None
+        output_directory = os.path.abspath(output_directory)
+    
+    # Compute the name of the structure.
+    structure_name = os.path.splitext(os.path.basename(structure_path))[0]
+
+    num_samples = number_of_batches * batch_size
+
+    # Run the diffusion sequence design sampler.
+    try:
+        command = [
+            "apptainer",
+            "exec",
+            na_mpnn_apptainer_path,
+            "python",
+            na_mpnn_path,
+            "--checkpoint",
+            str(na_mpnn_model_path),
+            "--config",
+            str(na_mpnn_config_path),
+            "--pdb_path",
+            str(structure_path),
+            "--output_dir",
+            str(output_directory),
+            "--num_samples",
+            str(num_samples),
+            "--temperature",
+            str(temperature),
+        ]
+        if not design_na_only:
+            command.append("--mask_all")
+
+        subprocess.run(
+            command,
+            check = True,
+            stdout = subprocess.DEVNULL,
+            stderr = subprocess.DEVNULL
+        )
+
+        # Check that the output fasta file exists.
+        fasta_path = os.path.join(output_directory, "generated_sequences.fasta")
+        if not os.path.exists(fasta_path):
+            raise ValueError(f"Output fasta file not found: {fasta_path}")
+
+        # Read the output fasta file.
+        fasta_entries = read_fasta_file(fasta_path)
+
+        # Skip the first entry of the fasta, which contains the parent sequence.
+        fasta_entries = fasta_entries[1:]
+
+        design_data = []
+        for i, (fasta_header, fasta_sequence) in enumerate(fasta_entries, start = 1):
+            design_id = str(i)
+
+            design_dict = {
+                "input_structure_name": structure_name,
+                "input_structure_path": structure_path,
+                "design_id": design_id,
+                "name": f"{structure_name}_{design_id}",
+                "design_sequence": fasta_sequence,
+                "tool_reported_sequence_recovery": np.nan,
+                "design_method": "naiad",
+                "model_weights_path": na_mpnn_model_path,
+                "model_config_path": na_mpnn_config_path
+            }
+
+            design_data.append(design_dict)
+
+        # Clean up the temporary directory if it was created.
+        if tmp_directory is not None:
+            tmp_directory.cleanup()
+
+        return design_data
+    except (subprocess.CalledProcessError, ValueError) as e:
+        # Clean up the temporary directory if it was created.
+        if tmp_directory is not None:
+            tmp_directory.cleanup()
+        raise e
+    
+def run_grnade(structure_path,
+               output_directory = None,
+               n_samples = 1,
+               temperature = 0.1,
+               grnade_apptainer_path = str(DEFAULT_CONTAINER_DIR / "grnade.sif"),
+               grnade_path = str(DEFAULT_SOFTWARE_DIR / "gRNAde" / "gRNAde.py")):
+    """
+    Given a structure path, runs the gRNAde sequence design algorithm to
+    generate sequences for the structure. The output is a list of dictionaries
+    containing the design ID, name, design sequence, and tool-reported sequence
+    recovery.
+
+    Args:
+        structure_path (str): The path to the structure file.
+        output_directory (str): The path to the output directory. If not
+            specified, a temporary directory will be created.
+        n_samples (int): The number of samples to generate.
+        temperature (float): The temperature for the gRNAde algorithm.
+        grnade_apptainer_path (str): The path to the gRNAde apptainer.
+        grnade_path (str): The path to the gRNAde run file.
+    
+    Returns:
+        design_data (dict list): A list of dictionaries containing:
+            input_structure_name (str): The name of the input structure.
+            input_structure_path (str): The path to the input structure.
+            design_id (str): The design ID.
+            name (str): The name of the design.
+            design_sequence (str): The design sequence.
+            tool_reported_sequence_recovery (float): The tool-reported sequence
+                recovery.
+            design_method (str): The design method used.
+            model_weights_path (str): The path to the model weights used.
+    """
+    # Convert the structure path to an absolute path.
+    structure_path = os.path.abspath(structure_path)
+
+    # Check that the structure path exists.
+    if not os.path.exists(structure_path):
+        raise ValueError(f"Structure file not found: {structure_path}")
+    
+    # If the output directory is not specified, create a temporary directory.
+    # The temporary directory will be automatically cleaned up when the script
+    # exits.
+    if output_directory is None:
+        tmp_directory = tempfile.TemporaryDirectory()
+        output_directory = tmp_directory.name
+    else:
+        tmp_directory = None
+        output_directory = os.path.abspath(output_directory)
+    
+    # Compute the output directory for the sequences.
+    seqs_output_directory = os.path.join(output_directory, "seqs")
+
+    # Create the output directory if it does not exist.
+    os.makedirs(seqs_output_directory, exist_ok = True)
+
+    # Compute the name of the structure.
+    structure_name = os.path.splitext(os.path.basename(structure_path))[0]
+
+    # Run the gRNAde sequence design algorithm.
+    try:
+        subprocess.run(
+            [
+                "apptainer",
+                "exec",
+                grnade_apptainer_path,
+                "python",
+                grnade_path,
+                "--pdb_filepath",
+                str(structure_path),
+                "--output_filepath",
+                os.path.join(seqs_output_directory, f"{structure_name}.fa"),
+                "--split",
+                "das",
+                "--max_num_conformers",
+                str(1),
+                "--n_samples",
+                str(n_samples),
+                "--temperature",
+                str(temperature)
+            ],
+            check = True,
+            stdout = subprocess.DEVNULL,
+            stderr = subprocess.DEVNULL
+        )
+
+        # Check that the output fasta file exists.
+        fasta_path = os.path.join(seqs_output_directory, f"{structure_name}.fa")
+        if not os.path.exists(fasta_path):
+            raise ValueError(f"Output fasta file not found: {fasta_path}")
+
+        # Read the output fasta file.
+        fasta_entries = read_fasta_file(fasta_path)
+
+        # Skip the first entry of the fasta, which contains the parent sequence.
+        fasta_entries = fasta_entries[1:]
+
+        design_data = []
+        for fasta_header, fasta_sequence in fasta_entries:
+            fasta_header = fasta_header.strip()
+            fasta_header_metadata = fasta_header.split(", ")
+
+            metadata_dict = dict()
+            for metadata in fasta_header_metadata:
+                metadata = metadata.strip()
+                metadata_name, metadata_value = metadata.split("=")
+                metadata_dict[metadata_name] = metadata_value
+            
+            design_dict = {
+                "input_structure_name": structure_name,
+                "input_structure_path": structure_path,
+                "design_id": metadata_dict["sample"],
+                "name": f"{structure_name}_{metadata_dict['sample']}",
+                "design_sequence": fasta_sequence.replace("\n", ""),
+                "tool_reported_sequence_recovery": float(metadata_dict["recovery"]),
+                "design_method": "grnade",
+                "model_weights_path": ""
+            }
+        
+            design_data.append(design_dict)
+        
+        # Clean up the temporary directory if it was created.
+        if tmp_directory is not None:
+            tmp_directory.cleanup()
+
+        return design_data
+    except (subprocess.CalledProcessError, ValueError) as e:
+        # Clean up the temporary directory if it was created.
+        if tmp_directory is not None:
+            tmp_directory.cleanup()
+        raise e
+
+def run_ridiffusion(structure_path,
+                    output_directory = None,
+                    n_samples = 1,
+                    ridiffusion_apptainer_path = str(DEFAULT_CONTAINER_DIR / "ridiffusion.sif"),
+                    ridiffusion_path = str(DEFAULT_SOFTWARE_DIR / "RIdiffusion" / "seq_generator.py")):
+    """
+    Given a structure path, runs the RIdiffusion sequence design algorithm to
+    generate sequences for the structure. The output is a list of dictionaries
+    containing the design ID, name, design sequence, and tool-reported sequence
+    recovery.
+
+    Args:
+        structure_path (str): The path to the structure file.
+        output_directory (str): The path to the output directory. If not
+            specified, a temporary directory will be created.
+        n_samples (int): The number of samples to generate.
+        ridiffusion_apptainer_path (str): The path to the RIdiffusion
+            apptainer.
+        ridiffusion_path (str): The path to the RIdiffusion run file.
+    
+    Returns:
+        design_data (dict list): A list of dictionaries containing:
+            input_structure_name (str): The name of the input structure.
+            input_structure_path (str): The path to the input structure.
+            design_id (str): The design ID.
+            name (str): The name of the design.
+            design_sequence (str): The design sequence.
+            tool_reported_sequence_recovery (float): The tool-reported sequence
+                recovery.
+            design_method (str): The design method used.
+            model_weights_path (str): The path to the model weights used.
+    """
+    # Convert the structure path to an absolute path.
+    structure_path = os.path.abspath(structure_path)
+
+    # Check that the structure path exists.
+    if not os.path.exists(structure_path):
+        raise ValueError(f"Structure file not found: {structure_path}")
+    
+    # If the output directory is not specified, create a temporary directory.
+    # The temporary directory will be automatically cleaned up when the script
+    # exits.
+    if output_directory is None:
+        tmp_directory = tempfile.TemporaryDirectory()
+        output_directory = tmp_directory.name
+    else:
+        tmp_directory = None
+        output_directory = os.path.abspath(output_directory)
+    
+    # Compute the output directory for the sequences.
+    seqs_output_directory = os.path.join(output_directory, "seqs")
+
+    # Create the output directory if it does not exist.
+    os.makedirs(seqs_output_directory, exist_ok = True)
+
+    # Compute the name of the structure.
+    structure_name = os.path.splitext(os.path.basename(structure_path))[0]
+
+    fasta_path = os.path.join(seqs_output_directory, f"{structure_name}.fa")
+
+    # Run the RIdiffusion sequence design algorithm.
+    input_pdb_directory = tempfile.TemporaryDirectory()
+    try:
+        input_structure_path = os.path.join(
+            input_pdb_directory.name,
+            os.path.basename(structure_path)
+        )
+        shutil.copy(structure_path, input_structure_path)
+
+        subprocess.run(
+            [
+                "apptainer",
+                "exec",
+                "--nv",
+                ridiffusion_apptainer_path,
+                "python",
+                ridiffusion_path,
+                "--pdb_dir",
+                str(input_pdb_directory.name),
+                "--num_samples",
+                str(n_samples),
+                "--output_file",
+                str(fasta_path)
+            ],
+            check = True,
+            cwd = os.path.dirname(ridiffusion_path),
+            stdout = subprocess.DEVNULL,
+            stderr = subprocess.DEVNULL
+        )
+
+        # Check that the output fasta file exists.
+        if not os.path.exists(fasta_path):
+            raise ValueError(f"Output fasta file not found: {fasta_path}")
+
+        # Read the output fasta file.
+        fasta_entries = read_fasta_file(fasta_path)
+
+        # Skip the first entry of the fasta, which contains the parent sequence.
+        fasta_entries = fasta_entries[1:]
+
+        design_data = []
+        for fasta_header, fasta_sequence in fasta_entries:
+            fasta_header = fasta_header.strip()
+            fasta_sequence = fasta_sequence.replace("\n", "")
+
+            fasta_header_name, tool_reported_sequence_recovery = \
+                fasta_header.split("--")
+            design_id = fasta_header_name.split("_")[0].replace("seq", "")
+
+            design_dict = {
+                "input_structure_name": structure_name,
+                "input_structure_path": structure_path,
+                "design_id": design_id,
+                "name": f"{structure_name}_{design_id}",
+                "design_sequence": fasta_sequence,
+                "tool_reported_sequence_recovery": float(tool_reported_sequence_recovery),
+                "design_method": "ridiffusion",
+                "model_weights_path": ""
+            }
+
+            design_data.append(design_dict)
+
+        input_pdb_directory.cleanup()
+
+        # Clean up the temporary directory if it was created.
+        if tmp_directory is not None:
+            tmp_directory.cleanup()
+
+        return design_data
+    except (subprocess.CalledProcessError, ValueError) as e:
+        input_pdb_directory.cleanup()
+
+        # Clean up the temporary directory if it was created.
+        if tmp_directory is not None:
+            tmp_directory.cleanup()
+        raise e
+
+def run_rhodesign(structure_path,
+                  output_directory = None,
+                  n_samples = 1,
+                  temperature = 0.1,
+                  rhodesign_apptainer_path = str(DEFAULT_CONTAINER_DIR / "rhodesign.sif"),
+                  rhodesign_path = str(DEFAULT_SOFTWARE_DIR / "RhoDesign" / "src" / "inference_without2d.py")):
+    """
+    Given a structure path, runs the RhoDesign sequence design algorithm to
+    generate sequences for the structure. The output is a list of dictionaries
+    containing the design ID, name, design sequence, and tool-reported sequence
+    recovery.
+
+    Args:
+        structure_path (str): The path to the structure file.
+        output_directory (str): The path to the output directory. If not
+            specified, a temporary directory will be created.
+        n_samples (int): The number of samples to generate.
+        temperature (float): The temperature for the RhoDesign algorithm.
+        rhodesign_apptainer_path (str): The path to the RhoDesign apptainer.
+        rhodesign_path (str): The path to the RhoDesign run file.
+    
+    Returns:
+        design_data (dict list): A list of dictionaries containing:
+            input_structure_name (str): The name of the input structure.
+            input_structure_path (str): The path to the input structure.
+            design_id (str): The design ID.
+            name (str): The name of the design.
+            design_sequence (str): The design sequence.
+            tool_reported_sequence_recovery (float): The tool-reported sequence
+                recovery.
+            design_method (str): The design method used.
+            model_weights_path (str): The path to the model weights used.
+    """
+    # Convert the structure path to an absolute path.
+    structure_path = os.path.abspath(structure_path)
+
+    # Check that the structure path exists.
+    if not os.path.exists(structure_path):
+        raise ValueError(f"Structure file not found: {structure_path}")
+    
+    # If the output directory is not specified, create a temporary directory.
+    # The temporary directory will be automatically cleaned up when the script
+    # exits.
+    if output_directory is None:
+        tmp_directory = tempfile.TemporaryDirectory()
+        output_directory = tmp_directory.name
+    else:
+        tmp_directory = None
+        output_directory = os.path.abspath(output_directory)
+    
+    # Compute the output directory for the sequences.
+    seqs_output_directory = os.path.join(output_directory, "seqs")
+
+    # Create the output directory if it does not exist.
+    os.makedirs(seqs_output_directory, exist_ok = True)
+
+    # Compute the name of the structure.
+    structure_name = os.path.splitext(os.path.basename(structure_path))[0]
+
+    # Run the RhoDesign sequence design algorithm.
+    try:
+        fasta_entries = []
+        design_data = []
+        for i in range(n_samples):
+            # Create a temporary directory for the output.
+            output_directory_i = tempfile.TemporaryDirectory()
+
+            # Create a temporary file for the standard output.
+            output_file_i = tempfile.NamedTemporaryFile(mode = "wt", suffix = ".txt")
+
+            subprocess.run(
+                [
+                    "apptainer",
+                    "exec",
+                    rhodesign_apptainer_path,
+                    "python",
+                    rhodesign_path,
+                    "-pdb",
+                    str(structure_path),
+                    "-save",
+                    str(output_directory_i.name),
+                    "-temp",
+                    str(temperature)
+                ],
+                check = True,
+                stdout = output_file_i,
+                stderr = subprocess.DEVNULL
+            )
+
+            # Do not keep the output saved by RhoDesign.
+            output_directory_i.cleanup()
+
+            # Read and close the ith output file.
+            output_text = read_text_file(output_file_i.name)
+            output_file_i.close()
+
+            # Extract the sequence and sequence recovery from the output.
+            for line in output_text.split("\n"):
+                if line.startswith("sequence: "):
+                    sequence = line.split(": ")[1].strip()
+                elif line.startswith("recovery rate: "):
+                    tool_reported_sequence_recovery = line.split(": ")[1].strip()
+            
+            # Add an entry to the fasta.
+            fasta_entries.append(
+                (f">{structure_name}, id={i}, seq_rec={tool_reported_sequence_recovery}", 
+                 sequence)
+            )
+
+            # Create a dictionary for the design data.
+            design_dict = {
+                "input_structure_name": structure_name,
+                "input_structure_path": structure_path,
+                "design_id": str(i),
+                "name": f"{structure_name}_{i}",
+                "design_sequence": sequence,
+                "tool_reported_sequence_recovery": float(tool_reported_sequence_recovery),
+                "design_method": "rhodesign",
+                "model_weights_path": ""
+            }
+
+            design_data.append(design_dict)
+
+        # Write the fasta entries to a file.
+        fasta_path = os.path.join(seqs_output_directory, f"{structure_name}.fa")
+        write_fasta_file(fasta_path, fasta_entries)
+
+        # Clean up the temporary directory if it was created.
+        if tmp_directory is not None:
+            tmp_directory.cleanup()
+
+        return design_data
+    except (subprocess.CalledProcessError, ValueError) as e:
+        # Clean up the temporary directory if it was created.
+        if tmp_directory is not None:
+            tmp_directory.cleanup()
+        
+        # Clean up the output file and output directory for the ith sample.
+        output_directory_i.cleanup()
+        output_file_i.close()
+
+        raise e
+
+def extract_na_sequence_data_from_design_sequence(design_sequence,
+                                                  design_method):
+    """
+    Given a design sequence, extracts the designed nucleic acid sequences.
+
+    Args:
+        design_sequence (str): The raw design sequence returned by the design
+            method.
+        design_method (str): The design method used.
+
+    Returns:
+        na_sequence_data ((str, ChainType) list): The designed nucleic acid
+            sequence data.
+    """
+    def infer_na_chain_type_from_na_mpnn_sequence(chain_sequence):
+        has_dna_char = False
+        has_rna_char = False
+        has_protein_char = False
+
+        for c in chain_sequence:
+            if c in NAConstants.na_mpnn_dna_chars:
+                has_dna_char = True
+            elif c in NAConstants.na_mpnn_rna_chars:
+                has_rna_char = True
+            elif c in NAConstants.na_mpnn_protein_chars:
+                has_protein_char = True
+            else:
+                raise ValueError(
+                    f"Unable to classify design chain sequence: {chain_sequence}"
+                )
+
+        # Determine chain type.
+        if not has_dna_char and not has_rna_char and has_protein_char:
+            return None
+        elif has_dna_char and not has_rna_char and not has_protein_char:
+            return ChainType.DNA
+        elif not has_dna_char and has_rna_char and not has_protein_char:
+            return ChainType.RNA
+        elif has_dna_char and has_rna_char and not has_protein_char:
+            return ChainType.DNA_RNA_HYBRID
+        elif has_protein_char:
+            raise ValueError(
+                "Unable to classify mixed protein/nucleic acid design chain "
+                f"sequence: {chain_sequence}"
+            )
+
+        raise ValueError(
+            f"Unable to classify empty design chain sequence: {chain_sequence}"
+        )
+
+    chain_sequences = design_sequence.split(NAConstants.chain_break_character)
+
+    if design_method in ("naiad", "na_mpnn"):
+        na_sequence_data = []
+        for chain_sequence in chain_sequences:
+            if len(chain_sequence) == 0:
+                raise Exception(
+                    "Design sequence contains an empty chain sequence"
+                )
+
+            chain_type = infer_na_chain_type_from_na_mpnn_sequence(
+                chain_sequence
+            )
+            if chain_type is None:
+                continue
+
+            na_sequence_data.append((chain_sequence, chain_type))
+        
+        na_sequence_data = standardize_na_sequence(
+            na_sequence_data,
+            method = "na_mpnn"
+        )
+    elif design_method in ("grnade", "ridiffusion", "rhodesign"):
+        na_sequence_data = []
+        for chain_sequence in chain_sequences:
+            if len(chain_sequence) == 0:
+                raise Exception(
+                    "Design sequence contains an empty chain sequence"
+                )
+            
+            na_sequence_data.append((chain_sequence, ChainType.RNA))
+        
+        na_sequence_data = standardize_na_sequence(na_sequence_data)
+    else:
+        raise ValueError(f"Invalid sequence design method: {design_method}")
+
+    # Designed NA sequences must be concrete; downstream design processing does
+    # not treat unknown residues as valid outputs.
+    check_na_sequence_validity(
+        na_sequence_data,
+        unknown_residue_allowed = False
+    )
+
+    return na_sequence_data
 
 ################################################################################
 # Sequence Comparison
@@ -2540,885 +3247,6 @@ def calculate_reactivity_profile_score(reference_secondary_structure,
 
     return result
 
-################################################################################
-# Structure Comparison
-################################################################################
-def run_us_align(reference_structure_path,
-                 subject_structure_path,
-                 mol = "RNA",
-                 mm = 0,
-                 ter = 2,
-                 atom = "auto",
-                 het = 1,
-                 us_align_path = "/projects/ml/afavor/alignment/USalign"):
-    """
-    Given a reference structure path and a subject structure path, aligns the
-    subject structure to the reference structure using US-Align, and calculates
-    the root mean square deviation (RMSD) and TM-score between the aligned
-    structures.
-
-    Args:
-        reference_structure_path (str): The path to the reference structure to
-            align to. Reference structure will remain fixed.
-        subject_structure_path (str): The path to the structure to align. This 
-            structure will be superimposed onto the reference structure.
-        mol (str): Type of molecule(s) to align.
-            Options:
-                "auto": align both protein and nucleic acids.
-                "prot": only align proteins in a structure.
-                "RNA": (default) only align RNA and DNA in a structure.
-        mm (int): Multimeric alignment option.
-            Options:
-                0: (default) alignment of two monomeric structures.
-                1: alignment of two multi-chain oligomeric structures.
-                2: alignment of individual chains to an oligomeric structure.
-                3: alignment of circularly permuted structure.
-                4: alignment of multiple monomeric chains into a consensus 
-                    alignment.
-                5: fully non-sequential (fNS) alignment.
-                6: semi-non-sequential (sNS) alignment.
-                To use -mm 1 or -mm 2, '-ter' option must be 0 or 1.
-        ter (int): Number of chains to align.
-            Options:
-                3: only align the first chain, or the first segment of the
-                    first chain as marked by the 'TER' string in PDB file.
-                2: (default) only align the first chain.
-                1: align all chains of the first model (recommended for aligning
-                    asymmetric units).
-                0: align all chains from all models (recommended for aligning
-                    biological assemblies, i.e. biounits).
-        atom (str): 4-character atom name used to represent a residue. This is
-            the atom that will be used to align the structures.
-            Options:
-                "auto": (default) " C3'" for RNA/DNA and " CA " for proteins.
-                    four-character atom name: e.g. " C3'" for RNA/DNA and " CA " 
-                    for proteins. Note, if mol is set to "auto", atom must also
-                    be set to "auto". This is because it is not possible to
-                    specify atoms for both protein and nucleic acids. This will
-                    result in only the corresponding molecule being aligned.
-        het (int): Whether to align residues marked as 'HETATM' in addition to
-            'ATOM  '.
-            Options:
-                0: (default) only align 'ATOM  ' residues.
-                1: align both 'ATOM  ' and 'HETATM' residues.
-                2: align both 'ATOM  ' and MSE residues.
-        us_align_path (str): The path to the US-Align executable.
-
-    Returns:
-        result (dict): A dictionary containing:
-            loaded_subject_structure_path (str): The path to the subject
-                structure as loaded by US-Align.
-            loaded_reference_structure_path (str): The path to the reference
-                structure as loaded by US-Align.
-            loaded_subject_length (int): The length of the subject structure as
-                loaded by US-Align.
-            loaded_reference_length (int): The length of the reference 
-                structure as loaded by US-Align.
-            aligned_length (int): The length of the aligned region between the
-                subject and reference structures.
-            sequence_identity (n_identical/n_aligned) (float): The sequence 
-                identity (n_identical/n_aligned) between the subject and 
-                reference structures in the aligned region.
-            rmsd (float): The root mean square deviation (RMSD) between the 
-                aligned structures.
-            tm_score (float): The TM-score between the aligned structures,
-                normalized by the length of the reference structure.
-            error_sequence_too_short (bool): Whether the alignment failed due
-                to the sequence being too short.
-            error_cannot_parse_file (bool): Whether the alignment failed due to
-                US-Align being unable to parse the input structure files.
-    """
-    # Check that the mol and atom options agree.
-    if mol == "auto" and atom != "auto":
-        raise ValueError(
-            "If mol is set to 'auto', atom must also be set to 'auto'."
-        )
-
-    # Convert the structure paths to absolute paths.
-    subject_structure_path = os.path.abspath(subject_structure_path)
-    reference_structure_path = os.path.abspath(reference_structure_path)
-
-    # Check that the structure paths exist.
-    if not os.path.exists(subject_structure_path):
-        raise ValueError(f"Structure file not found: {subject_structure_path}")
-    if not os.path.exists(reference_structure_path):
-        raise ValueError(
-            f"Structure file not found: {reference_structure_path}"
-        )
-
-    # Create a temporary file for the US-Align output.
-    us_align_output_file = tempfile.NamedTemporaryFile(mode = "wt")
-    us_align_error_file = tempfile.NamedTemporaryFile(mode = "wt")
-
-    # Run US-Align.
-    try:
-        subprocess.run(
-            [
-                str(us_align_path),
-                "-mol",
-                str(mol),
-                "-mm",
-                str(mm),
-                "-ter",
-                str(ter), 
-                "-atom",
-                str(atom),
-                "-het",
-                str(het),
-                str(subject_structure_path),
-                str(reference_structure_path)
-            ],
-            check = True,
-            stdout = us_align_output_file,
-            stderr = us_align_error_file
-        )
-
-        us_align_output_text = read_text_file(us_align_output_file.name)
-        us_align_error_text = read_text_file(us_align_error_file.name)
-    
-        # Extract the TM-score and RMSD from the US-Align output.
-        loaded_subject_structure_path = None
-        loaded_reference_structure_path = None
-        loaded_subject_length = None
-        loaded_reference_length = None
-        aligned_length = None
-        rmsd = None
-        sequence_identity = None
-        tm_score = None
-        for line in us_align_output_text.split("\n"):
-            if line.startswith("Name of Structure_1:"):
-                loaded_subject_structure_path = line.split(
-                    "Name of Structure_1:"
-                )[1].split("(to be superimposed onto Structure_2)")[0].strip()
-            elif line.startswith("Name of Structure_2:"):
-                loaded_reference_structure_path = line.split(
-                    "Name of Structure_2:"
-                )[1].strip()
-            elif line.startswith("Length of Structure_1:"):
-                loaded_subject_length = int(line.split(
-                    "Length of Structure_1:"
-                )[1].split("residues")[0].strip())
-            elif line.startswith("Length of Structure_2:"):
-                loaded_reference_length = int(line.split(
-                    "Length of Structure_2:"
-                )[1].split("residues")[0].strip())
-            elif line.startswith("Aligned length="):
-                aligned_length = int(line.split(
-                    "Aligned length="
-                )[1].split(",")[0].strip())
-                rmsd = float(line.split("RMSD=")[1].split(",")[0].strip())
-                sequence_identity = float(line.split(
-                    "Seq_ID=n_identical/n_aligned=")[1].strip()
-                )
-            elif (
-                line.startswith("TM-score=") and 
-                "normalized by length of Structure_2" in line
-            ):
-                tm_score = float(line.split(
-                    "TM-score="
-                )[1].split("(normalized by length of Structure_2")[0].strip())
-
-        # Close files. 
-        us_align_output_file.close()
-        us_align_error_file.close()
-        
-        # Parse errors.
-        error_sequence_too_short = False
-        error_cannot_parse_file = False
-        if tm_score is None:
-            if "Sequence is too short" in us_align_error_text:
-                error_sequence_too_short = True
-            elif "Warning! Cannot parse file" in us_align_error_text:
-                error_cannot_parse_file = True
-            else:
-                raise ValueError(
-                    "Failed to extract RMSD and TM-score from US-Align output."
-                )
-        
-        result = {
-            "loaded_subject_structure_path": loaded_subject_structure_path,
-            "loaded_reference_structure_path": loaded_reference_structure_path,
-            "loaded_subject_length": loaded_subject_length,
-            "loaded_reference_length": loaded_reference_length,
-            "aligned_length": aligned_length,
-            "sequence_identity (n_identical/n_aligned)": sequence_identity,
-            "rmsd": rmsd,
-            "tm_score": tm_score,
-            "error_sequence_too_short": error_sequence_too_short,
-            "error_cannot_parse_file": error_cannot_parse_file
-        }
-
-        return result
-    except (subprocess.CalledProcessError, ValueError) as e:
-        us_align_output_file.close()
-        us_align_error_file.close()
-        raise e
-
-################################################################################
-# Sequence design
-################################################################################
-def run_na_mpnn_sequence(structure_path, 
-                         output_directory = None,
-                         batch_size = 1,
-                         number_of_batches = 1,
-                         temperature = 0.1,
-                         omit_AA = "",
-                         design_na_only = 0,
-                         load_residues_with_missing_atoms = 0,
-                         output_pdbs = 0,
-                         catch_failed_inferences = 1,
-                         na_mpnn_apptainer_path = "/software/containers/mlfold.sif",
-                         na_mpnn_path = "/home/akubaney/projects/fused_mpnn/run.py",
-                         na_mpnn_model_path = None):
-    """
-    Given a structure path, runs the NA-MPNN sequence design algorithm to
-    generate sequences for the structure. The output is a list of dictionaries
-    containing the design ID, name, design sequence, and tool-reported sequence
-    recovery.
-
-    Args:
-        structure_path (str): The path to the structure file.
-        output_directory (str): The path to the output directory. If not
-            specified, a temporary directory will be created.
-        batch_size (int): The batch size for the NA-MPNN algorithm.
-        number_of_batches (int): The number of batches to run.
-        temperature (float): The temperature for the NA-MPNN algorithm.
-        omit_AA (str): The amino acids to omit from the design.
-        design_na_only (int): Whether to design only nucleic acids.
-        load_residues_with_missing_atoms (int): Whether to load residues with
-            missing atoms.
-        output_pdbs (int): Whether to output PDB files.
-        catch_failed_inferences (int): Whether to catch failed inferences.
-        na_mpnn_apptainer_path (str): The path to the NA-MPNN apptainer.
-        na_mpnn_path (str): The path to the NA-MPNN run file.
-        na_mpnn_model_path (str): The path to the NA-MPNN model file.
-    
-    Returns:
-        design_data (dict list): A list of dictionaries containing:
-            input_structure_name (str): The name of the input structure.
-            input_structure_path (str): The path to the input structure.
-            design_id (str): The design ID.
-            name (str): The name of the design.
-            design_sequence (str): The design sequence.
-            tool_reported_sequence_recovery (float): The tool-reported sequence
-                recovery.
-            design_method (str): The design method used.
-            model_weights_path (str): The path to the model weights used.
-    """
-    # Convert the structure path to an absolute path.
-    structure_path = os.path.abspath(structure_path)
-
-    # Check that the structure path exists.
-    if not os.path.exists(structure_path):
-        raise ValueError(f"Structure file not found: {structure_path}")
-
-    # If the output directory is not specified, create a temporary directory.
-    # The temporary directory will be automatically cleaned up when the script
-    # exits.
-    if output_directory is None:
-        tmp_directory = tempfile.TemporaryDirectory()
-        output_directory = tmp_directory.name
-    else:
-        tmp_directory = None
-        output_directory = os.path.abspath(output_directory)
-    
-    # Compute the output directory for the sequences.
-    seqs_output_directory = os.path.join(output_directory, "seqs")
-    
-    # Compute the name of the structure.
-    structure_name = os.path.splitext(os.path.basename(structure_path))[0]
-
-    # Run the NA-MPNN sequence design algorithm.
-    try:
-        subprocess.run(
-            [
-                "apptainer",
-                "exec",
-                na_mpnn_apptainer_path,
-                "python",
-                na_mpnn_path,
-                "--model_type",
-                str("na_mpnn"),
-                "--checkpoint_na_mpnn",
-                str(na_mpnn_model_path),
-                "--pdb_path",
-                str(structure_path),
-                "--out_folder",
-                str(output_directory),
-                "--number_of_batches",
-                str(number_of_batches),
-                "--batch_size",
-                str(batch_size),
-                "--temperature",
-                str(temperature),
-                "--omit_AA",
-                str(omit_AA),
-                "--design_na_only",
-                str(design_na_only),
-                "--load_residues_with_missing_atoms",
-                str(load_residues_with_missing_atoms),
-                "--output_pdbs",
-                str(output_pdbs),
-                "--catch_failed_inferences",
-                str(catch_failed_inferences)                
-            ],
-            check = True,
-            stdout = subprocess.DEVNULL,
-            stderr = subprocess.DEVNULL
-        )
-
-        # Check that the output fasta file exists.
-        fasta_path = os.path.join(seqs_output_directory, f"{structure_name}.fa")
-        if not os.path.exists(fasta_path):
-            raise ValueError(f"Output fasta file not found: {fasta_path}")
-
-        # Read the output fasta file.
-        fasta_entries = read_fasta_file(fasta_path)
-
-        # Skip the first entry of the fasta, which contains the parent sequence.
-        fasta_entries = fasta_entries[1:]
-
-        design_data = []
-        for fasta_header, fasta_sequence in fasta_entries:
-            fasta_header = fasta_header.strip()
-            fasta_header_metadata = fasta_header.split(", ")
-
-            metadata_dict = dict()
-            for metadata in fasta_header_metadata[1:]:
-                metadata = metadata.strip()
-                metadata_name, metadata_value = metadata.split("=")
-                metadata_dict[metadata_name] = metadata_value
-
-            design_dict = {
-                "input_structure_name": structure_name,
-                "input_structure_path": structure_path,
-                "design_id": metadata_dict["id"],
-                "name": f"{structure_name}_{metadata_dict['id']}",
-                "design_sequence": fasta_sequence,
-                "tool_reported_sequence_recovery": float(metadata_dict["seq_rec"]),
-                "design_method": "na_mpnn",
-                "model_weights_path": na_mpnn_model_path
-            }
-
-            design_data.append(design_dict)
-
-        # Clean up the temporary directory if it was created.
-        if tmp_directory is not None:
-            tmp_directory.cleanup()
-
-        return design_data
-    except (subprocess.CalledProcessError, ValueError) as e:
-        # Clean up the temporary directory if it was created.
-        if tmp_directory is not None:
-            tmp_directory.cleanup()
-        raise e
-    
-def run_grnade(structure_path,
-               output_directory = None,
-               n_samples = 1,
-               temperature = 0.1,
-               grnade_apptainer_path = "/software/containers/users/akubaney/grnade.sif",
-               grnade_path = "/home/akubaney/software/gRNAde/gRNAde.py"):
-    """
-    Given a structure path, runs the gRNAde sequence design algorithm to
-    generate sequences for the structure. The output is a list of dictionaries
-    containing the design ID, name, design sequence, and tool-reported sequence
-    recovery.
-
-    Args:
-        structure_path (str): The path to the structure file.
-        output_directory (str): The path to the output directory. If not
-            specified, a temporary directory will be created.
-        n_samples (int): The number of samples to generate.
-        temperature (float): The temperature for the gRNAde algorithm.
-        grnade_apptainer_path (str): The path to the gRNAde apptainer.
-        grnade_path (str): The path to the gRNAde run file.
-    
-    Returns:
-        design_data (dict list): A list of dictionaries containing:
-            input_structure_name (str): The name of the input structure.
-            input_structure_path (str): The path to the input structure.
-            design_id (str): The design ID.
-            name (str): The name of the design.
-            design_sequence (str): The design sequence.
-            tool_reported_sequence_recovery (float): The tool-reported sequence
-                recovery.
-            design_method (str): The design method used.
-            model_weights_path (str): The path to the model weights used.
-    """
-    # Convert the structure path to an absolute path.
-    structure_path = os.path.abspath(structure_path)
-
-    # Check that the structure path exists.
-    if not os.path.exists(structure_path):
-        raise ValueError(f"Structure file not found: {structure_path}")
-    
-    # If the output directory is not specified, create a temporary directory.
-    # The temporary directory will be automatically cleaned up when the script
-    # exits.
-    if output_directory is None:
-        tmp_directory = tempfile.TemporaryDirectory()
-        output_directory = tmp_directory.name
-    else:
-        tmp_directory = None
-        output_directory = os.path.abspath(output_directory)
-    
-    # Compute the output directory for the sequences.
-    seqs_output_directory = os.path.join(output_directory, "seqs")
-
-    # Create the output directory if it does not exist.
-    os.makedirs(seqs_output_directory, exist_ok = True)
-
-    # Compute the name of the structure.
-    structure_name = os.path.splitext(os.path.basename(structure_path))[0]
-
-    # Run the gRNAde sequence design algorithm.
-    try:
-        subprocess.run(
-            [
-                "apptainer",
-                "exec",
-                grnade_apptainer_path,
-                "python",
-                grnade_path,
-                "--pdb_filepath",
-                str(structure_path),
-                "--output_filepath",
-                os.path.join(seqs_output_directory, f"{structure_name}.fa"),
-                "--split",
-                "das",
-                "--max_num_conformers",
-                str(1),
-                "--n_samples",
-                str(n_samples),
-                "--temperature",
-                str(temperature)
-            ],
-            check = True,
-            stdout = subprocess.DEVNULL,
-            stderr = subprocess.DEVNULL
-        )
-
-        # Check that the output fasta file exists.
-        fasta_path = os.path.join(seqs_output_directory, f"{structure_name}.fa")
-        if not os.path.exists(fasta_path):
-            raise ValueError(f"Output fasta file not found: {fasta_path}")
-
-        # Read the output fasta file.
-        fasta_entries = read_fasta_file(fasta_path)
-
-        # Skip the first entry of the fasta, which contains the parent sequence.
-        fasta_entries = fasta_entries[1:]
-
-        design_data = []
-        for fasta_header, fasta_sequence in fasta_entries:
-            fasta_header = fasta_header.strip()
-            fasta_header_metadata = fasta_header.split(", ")
-
-            metadata_dict = dict()
-            for metadata in fasta_header_metadata:
-                metadata = metadata.strip()
-                metadata_name, metadata_value = metadata.split("=")
-                metadata_dict[metadata_name] = metadata_value
-            
-            design_dict = {
-                "input_structure_name": structure_name,
-                "input_structure_path": structure_path,
-                "design_id": metadata_dict["sample"],
-                "name": f"{structure_name}_{metadata_dict['sample']}",
-                "design_sequence": fasta_sequence.replace("\n", ""),
-                "tool_reported_sequence_recovery": float(metadata_dict["recovery"]),
-                "design_method": "grnade",
-                "model_weights_path": ""
-            }
-        
-            design_data.append(design_dict)
-        
-        # Clean up the temporary directory if it was created.
-        if tmp_directory is not None:
-            tmp_directory.cleanup()
-
-        return design_data
-    except (subprocess.CalledProcessError, ValueError) as e:
-        # Clean up the temporary directory if it was created.
-        if tmp_directory is not None:
-            tmp_directory.cleanup()
-        raise e
-
-def run_ridiffusion(structure_path,
-                    output_directory = None,
-                    n_samples = 1,
-                    ridiffusion_apptainer_path = "/software/containers/users/akubaney/ridiffusion.sif",
-                    ridiffusion_path = "/home/akubaney/software/RIdiffusion/seq_generator.py"):
-    """
-    Given a structure path, runs the RIdiffusion sequence design algorithm to
-    generate sequences for the structure. The output is a list of dictionaries
-    containing the design ID, name, design sequence, and tool-reported sequence
-    recovery.
-
-    Args:
-        structure_path (str): The path to the structure file.
-        output_directory (str): The path to the output directory. If not
-            specified, a temporary directory will be created.
-        n_samples (int): The number of samples to generate.
-        ridiffusion_apptainer_path (str): The path to the RIdiffusion
-            apptainer.
-        ridiffusion_path (str): The path to the RIdiffusion run file.
-    
-    Returns:
-        design_data (dict list): A list of dictionaries containing:
-            input_structure_name (str): The name of the input structure.
-            input_structure_path (str): The path to the input structure.
-            design_id (str): The design ID.
-            name (str): The name of the design.
-            design_sequence (str): The design sequence.
-            tool_reported_sequence_recovery (float): The tool-reported sequence
-                recovery.
-            design_method (str): The design method used.
-            model_weights_path (str): The path to the model weights used.
-    """
-    # Convert the structure path to an absolute path.
-    structure_path = os.path.abspath(structure_path)
-
-    # Check that the structure path exists.
-    if not os.path.exists(structure_path):
-        raise ValueError(f"Structure file not found: {structure_path}")
-    
-    # If the output directory is not specified, create a temporary directory.
-    # The temporary directory will be automatically cleaned up when the script
-    # exits.
-    if output_directory is None:
-        tmp_directory = tempfile.TemporaryDirectory()
-        output_directory = tmp_directory.name
-    else:
-        tmp_directory = None
-        output_directory = os.path.abspath(output_directory)
-    
-    # Compute the output directory for the sequences.
-    seqs_output_directory = os.path.join(output_directory, "seqs")
-
-    # Create the output directory if it does not exist.
-    os.makedirs(seqs_output_directory, exist_ok = True)
-
-    # Compute the name of the structure.
-    structure_name = os.path.splitext(os.path.basename(structure_path))[0]
-
-    fasta_path = os.path.join(seqs_output_directory, f"{structure_name}.fa")
-
-    # Run the RIdiffusion sequence design algorithm.
-    input_pdb_directory = tempfile.TemporaryDirectory()
-    try:
-        input_structure_path = os.path.join(
-            input_pdb_directory.name,
-            os.path.basename(structure_path)
-        )
-        shutil.copy(structure_path, input_structure_path)
-
-        subprocess.run(
-            [
-                "apptainer",
-                "exec",
-                "--nv",
-                ridiffusion_apptainer_path,
-                "python",
-                ridiffusion_path,
-                "--pdb_dir",
-                str(input_pdb_directory.name),
-                "--num_samples",
-                str(n_samples),
-                "--output_file",
-                str(fasta_path)
-            ],
-            check = True,
-            cwd = os.path.dirname(ridiffusion_path),
-            stdout = subprocess.DEVNULL,
-            stderr = subprocess.DEVNULL
-        )
-
-        # Check that the output fasta file exists.
-        if not os.path.exists(fasta_path):
-            raise ValueError(f"Output fasta file not found: {fasta_path}")
-
-        # Read the output fasta file.
-        fasta_entries = read_fasta_file(fasta_path)
-
-        # Skip the first entry of the fasta, which contains the parent sequence.
-        fasta_entries = fasta_entries[1:]
-
-        design_data = []
-        for fasta_header, fasta_sequence in fasta_entries:
-            fasta_header = fasta_header.strip()
-            fasta_sequence = fasta_sequence.replace("\n", "")
-
-            fasta_header_name, tool_reported_sequence_recovery = \
-                fasta_header.split("--")
-            design_id = fasta_header_name.split("_")[0].replace("seq", "")
-
-            design_dict = {
-                "input_structure_name": structure_name,
-                "input_structure_path": structure_path,
-                "design_id": design_id,
-                "name": f"{structure_name}_{design_id}",
-                "design_sequence": fasta_sequence,
-                "tool_reported_sequence_recovery": float(tool_reported_sequence_recovery),
-                "design_method": "ridiffusion",
-                "model_weights_path": ""
-            }
-
-            design_data.append(design_dict)
-
-        input_pdb_directory.cleanup()
-
-        # Clean up the temporary directory if it was created.
-        if tmp_directory is not None:
-            tmp_directory.cleanup()
-
-        return design_data
-    except (subprocess.CalledProcessError, ValueError) as e:
-        input_pdb_directory.cleanup()
-
-        # Clean up the temporary directory if it was created.
-        if tmp_directory is not None:
-            tmp_directory.cleanup()
-        raise e
-
-def run_rhodesign(structure_path,
-                  output_directory = None,
-                  n_samples = 1,
-                  temperature = 0.1,
-                  rhodesign_apptainer_path = "/software/containers/users/akubaney/rhodesign.sif",
-                  rhodesign_path = "/home/akubaney/software/RhoDesign/src/inference_without2d.py"):
-    """
-    Given a structure path, runs the RhoDesign sequence design algorithm to
-    generate sequences for the structure. The output is a list of dictionaries
-    containing the design ID, name, design sequence, and tool-reported sequence
-    recovery.
-
-    Args:
-        structure_path (str): The path to the structure file.
-        output_directory (str): The path to the output directory. If not
-            specified, a temporary directory will be created.
-        n_samples (int): The number of samples to generate.
-        temperature (float): The temperature for the RhoDesign algorithm.
-        rhodesign_apptainer_path (str): The path to the RhoDesign apptainer.
-        rhodesign_path (str): The path to the RhoDesign run file.
-    
-    Returns:
-        design_data (dict list): A list of dictionaries containing:
-            input_structure_name (str): The name of the input structure.
-            input_structure_path (str): The path to the input structure.
-            design_id (str): The design ID.
-            name (str): The name of the design.
-            design_sequence (str): The design sequence.
-            tool_reported_sequence_recovery (float): The tool-reported sequence
-                recovery.
-            design_method (str): The design method used.
-            model_weights_path (str): The path to the model weights used.
-    """
-    # Convert the structure path to an absolute path.
-    structure_path = os.path.abspath(structure_path)
-
-    # Check that the structure path exists.
-    if not os.path.exists(structure_path):
-        raise ValueError(f"Structure file not found: {structure_path}")
-    
-    # If the output directory is not specified, create a temporary directory.
-    # The temporary directory will be automatically cleaned up when the script
-    # exits.
-    if output_directory is None:
-        tmp_directory = tempfile.TemporaryDirectory()
-        output_directory = tmp_directory.name
-    else:
-        tmp_directory = None
-        output_directory = os.path.abspath(output_directory)
-    
-    # Compute the output directory for the sequences.
-    seqs_output_directory = os.path.join(output_directory, "seqs")
-
-    # Create the output directory if it does not exist.
-    os.makedirs(seqs_output_directory, exist_ok = True)
-
-    # Compute the name of the structure.
-    structure_name = os.path.splitext(os.path.basename(structure_path))[0]
-
-    # Run the RhoDesign sequence design algorithm.
-    try:
-        fasta_entries = []
-        design_data = []
-        for i in range(n_samples):
-            # Create a temporary directory for the output.
-            output_directory_i = tempfile.TemporaryDirectory()
-
-            # Create a temporary file for the standard output.
-            output_file_i = tempfile.NamedTemporaryFile(mode = "wt", suffix = ".txt")
-
-            subprocess.run(
-                [
-                    "apptainer",
-                    "exec",
-                    rhodesign_apptainer_path,
-                    "python",
-                    rhodesign_path,
-                    "-pdb",
-                    str(structure_path),
-                    "-save",
-                    str(output_directory_i.name),
-                    "-temp",
-                    str(temperature)
-                ],
-                check = True,
-                stdout = output_file_i,
-                stderr = subprocess.DEVNULL
-            )
-
-            # Do not keep the output saved by RhoDesign.
-            output_directory_i.cleanup()
-
-            # Read and close the ith output file.
-            output_text = read_text_file(output_file_i.name)
-            output_file_i.close()
-
-            # Extract the sequence and sequence recovery from the output.
-            for line in output_text.split("\n"):
-                if line.startswith("sequence: "):
-                    sequence = line.split(": ")[1].strip()
-                elif line.startswith("recovery rate: "):
-                    tool_reported_sequence_recovery = line.split(": ")[1].strip()
-            
-            # Add an entry to the fasta.
-            fasta_entries.append(
-                (f">{structure_name}, id={i}, seq_rec={tool_reported_sequence_recovery}", 
-                 sequence)
-            )
-
-            # Create a dictionary for the design data.
-            design_dict = {
-                "input_structure_name": structure_name,
-                "input_structure_path": structure_path,
-                "design_id": str(i),
-                "name": f"{structure_name}_{i}",
-                "design_sequence": sequence,
-                "tool_reported_sequence_recovery": float(tool_reported_sequence_recovery),
-                "design_method": "rhodesign",
-                "model_weights_path": ""
-            }
-
-            design_data.append(design_dict)
-
-        # Write the fasta entries to a file.
-        fasta_path = os.path.join(seqs_output_directory, f"{structure_name}.fa")
-        write_fasta_file(fasta_path, fasta_entries)
-
-        # Clean up the temporary directory if it was created.
-        if tmp_directory is not None:
-            tmp_directory.cleanup()
-
-        return design_data
-    except (subprocess.CalledProcessError, ValueError) as e:
-        # Clean up the temporary directory if it was created.
-        if tmp_directory is not None:
-            tmp_directory.cleanup()
-        
-        # Clean up the output file and output directory for the ith sample.
-        output_directory_i.cleanup()
-        output_file_i.close()
-
-        raise e
-
-def extract_na_sequence_data_from_design_sequence(design_sequence,
-                                                  design_method):
-    """
-    Given a design sequence, extracts the designed nucleic acid sequences.
-
-    Args:
-        design_sequence (str): The raw design sequence returned by the design
-            method.
-        design_method (str): The design method used.
-
-    Returns:
-        na_sequence_data ((str, ChainType) list): The designed nucleic acid
-            sequence data.
-    """
-    def infer_na_chain_type_from_na_mpnn_sequence(chain_sequence):
-        has_dna_char = False
-        has_rna_char = False
-        has_protein_char = False
-
-        for c in chain_sequence:
-            if c in NAConstants.na_mpnn_dna_chars:
-                has_dna_char = True
-            elif c in NAConstants.na_mpnn_rna_chars:
-                has_rna_char = True
-            elif c in NAConstants.na_mpnn_protein_chars:
-                has_protein_char = True
-            else:
-                raise ValueError(
-                    f"Unable to classify design chain sequence: {chain_sequence}"
-                )
-
-        # Determine chain type.
-        if not has_dna_char and not has_rna_char and has_protein_char:
-            return None
-        elif has_dna_char and not has_rna_char and not has_protein_char:
-            return ChainType.DNA
-        elif not has_dna_char and has_rna_char and not has_protein_char:
-            return ChainType.RNA
-        elif has_dna_char and has_rna_char and not has_protein_char:
-            return ChainType.DNA_RNA_HYBRID
-        elif has_protein_char:
-            raise ValueError(
-                "Unable to classify mixed protein/nucleic acid design chain "
-                f"sequence: {chain_sequence}"
-            )
-
-        raise ValueError(
-            f"Unable to classify empty design chain sequence: {chain_sequence}"
-        )
-
-    chain_sequences = design_sequence.split(NAConstants.chain_break_character)
-
-    if design_method == "na_mpnn":
-        na_sequence_data = []
-        for chain_sequence in chain_sequences:
-            if len(chain_sequence) == 0:
-                raise Exception(
-                    "Design sequence contains an empty chain sequence"
-                )
-
-            chain_type = infer_na_chain_type_from_na_mpnn_sequence(
-                chain_sequence
-            )
-            if chain_type is None:
-                continue
-
-            na_sequence_data.append((chain_sequence, chain_type))
-        
-        na_sequence_data = standardize_na_sequence(
-            na_sequence_data,
-            method = "na_mpnn"
-        )
-    elif design_method in ("grnade", "ridiffusion", "rhodesign"):
-        na_sequence_data = []
-        for chain_sequence in chain_sequences:
-            if len(chain_sequence) == 0:
-                raise Exception(
-                    "Design sequence contains an empty chain sequence"
-                )
-            
-            na_sequence_data.append((chain_sequence, ChainType.RNA))
-        
-        na_sequence_data = standardize_na_sequence(na_sequence_data)
-    else:
-        raise ValueError(f"Invalid sequence design method: {design_method}")
-
-    # Designed NA sequences must be concrete; downstream design processing does
-    # not treat unknown residues as valid outputs.
-    check_na_sequence_validity(
-        na_sequence_data,
-        unknown_residue_allowed = False
-    )
-
-    return na_sequence_data
 
 ################################################################################
 # Combined Functionality
@@ -3618,8 +3446,9 @@ def design_nucleic_acid_sequence(structure_path,
                                  overall_output_directory,
                                  num_samples,
                                  temperature,
-                                 method = "na_mpnn",
+                                 method = "naiad",
                                  na_mpnn_model_path = None,
+                                 na_mpnn_config_path = None,
                                  with_protein = True):
     """
     Given a structure path, an overall output directory, the number of samples,
@@ -3628,17 +3457,19 @@ def design_nucleic_acid_sequence(structure_path,
     created for each design, containing the design ID, name, designed nucleic
     acid sequence data, protein sequences (from native), and metadata.
 
-    Only NA-MPNN supports DNA design and design in protein context.
+    Only NAIAD supports DNA design and design in protein context.
 
     Args:
         structure_path (str): The path to the structure file.
         overall_output_directory (str): The path to the overall output directory.
         num_samples (int): The number of samples to generate.
         temperature (float): The temperature for the sequence design algorithm.
-        method (str): The sequence design method to use. Options are "na_mpnn",
-            "grnade", "ridiffusion", and "rhodesign". Default is "na_mpnn".
-        na_mpnn_model_path (str): The path to the NA-MPNN model file. Required
-            if method is "na_mpnn".
+        method (str): The sequence design method to use. Options are "naiad",
+            "na_mpnn" (legacy alias), "grnade", "ridiffusion", and
+            "rhodesign". Default is "naiad".
+        na_mpnn_model_path (str): The path to the NAIAD model file. Required
+            if method is "naiad" or the legacy "na_mpnn" alias.
+        na_mpnn_config_path (str): The path to the NAIAD diffusion config.
         with_protein (bool): Whether to include protein chains as structural
             context during design. If False and the structure contains protein,
             protein chains are removed before design. Default is True.
@@ -3658,7 +3489,9 @@ def design_nucleic_acid_sequence(structure_path,
         temperature = 0.1
 
     if na_mpnn_model_path is None:
-        na_mpnn_model_path = "/home/akubaney/projects/na_mpnn/models/design_model/s_19137.pt"
+        na_mpnn_model_path = DEFAULT_NA_MPNN_MODEL_PATH
+    if na_mpnn_config_path is None:
+        na_mpnn_config_path = DEFAULT_NA_MPNN_CONFIG_PATH
 
     # Check that the structure path exists.
     if not os.path.exists(structure_path):
@@ -3710,12 +3543,17 @@ def design_nucleic_acid_sequence(structure_path,
     has_dna = complex_sequence_data["has_dna"]
 
     # Check method compatibility with DNA and protein context.
-    if method != "na_mpnn" and has_dna:
+    if method is None:
+        method = "naiad"
+    if method == "na_mpnn":
+        method = "naiad"
+
+    if method != "naiad" and has_dna:
         raise ValueError(
             f"Method '{method}' does not support DNA design. "
             f"Structure '{structure_name}' contains DNA chains."
         )
-    if method != "na_mpnn" and has_protein and with_protein:
+    if method != "naiad" and has_protein and with_protein:
         raise ValueError(
             f"Method '{method}' does not support design in protein context."
         )
@@ -3742,8 +3580,8 @@ def design_nucleic_acid_sequence(structure_path,
     os.makedirs(design_json_output_directory)
 
     try:
-        if method == "na_mpnn":
-            # Run NA-MPNN sequence design.
+        if method == "naiad":
+            # Run NAIAD diffusion sequence design.
             design_data = run_na_mpnn_sequence(
                 design_structure_path,
                 output_directory = output_directory,
@@ -3755,7 +3593,8 @@ def design_nucleic_acid_sequence(structure_path,
                 load_residues_with_missing_atoms = 0,
                 output_pdbs = 0,
                 catch_failed_inferences = 1,
-                na_mpnn_model_path = na_mpnn_model_path
+                na_mpnn_model_path = na_mpnn_model_path,
+                na_mpnn_config_path = na_mpnn_config_path
             )
         elif method == "grnade":
             # Run gRNAde sequence design.
@@ -4476,12 +4315,19 @@ if __name__ == "__main__":
     argument_parser.add_argument(
         "--method", 
         type = str,
-        help = "The method to use."
+        help = "The method to use.",
+        default = "naiad"
     )
     argument_parser.add_argument(
         "--na_mpnn_model_path", 
         type = str,
         help = "The path to the NA-MPNN model file.",
+        default = None
+    )
+    argument_parser.add_argument(
+        "--na_mpnn_config_path", 
+        type = str,
+        help = "The path to the NA-MPNN diffusion config file.",
         default = None
     )
     argument_parser.add_argument(
@@ -4516,6 +4362,7 @@ if __name__ == "__main__":
                                      args.temperature,
                                      method = args.method,
                                      na_mpnn_model_path = args.na_mpnn_model_path,
+                                     na_mpnn_config_path = args.na_mpnn_config_path,
                                      with_protein = bool(args.with_protein))
     elif args.function_name == "process_reference":
         process_reference(

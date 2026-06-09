@@ -1,6 +1,7 @@
 import sys
 import json
 import gzip
+import os
 import re
 import copy
 import collections
@@ -15,7 +16,6 @@ import pdbx
 from pdbx.reader.PdbxReader import PdbxReader
 from pdbx.reader.PdbxContainers import DataCategory
 
-#sys.path.insert(0, "/home/justas/projects/lab_github/chemnet/arch.22-10-28")
 import obutils
 import geometry
 
@@ -127,7 +127,13 @@ class CIFParser:
         self.randomize_nmr_model = randomize_nmr_model
 
         # parse pre-compiled library of all residues observed in the PDB
-        with gzip.open('/home/akubaney/projects/na_mpnn/data/datasets/rcsb_cif/ligands.json.gz','rt') as file:
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        rcsb_cif_dir = os.environ.get(
+            'NAIAD_RCSB_CIF_DIR',
+            os.path.join(repo_root, 'data', 'datasets', 'rcsb_cif')
+        )
+
+        with gzip.open(os.path.join(rcsb_cif_dir, 'ligands.json.gz'), 'rt') as file:
             self.mols = json.load(file)
             
             # residues to be ignored during parsing are
@@ -137,7 +143,7 @@ class CIFParser:
                     if res in self.mols.keys():
                         del self.mols[res]
             
-        with open('/home/akubaney/projects/na_mpnn/data/datasets/rcsb_cif/elements.txt','r') as f:
+        with open(os.path.join(rcsb_cif_dir, 'elements.txt'), 'r') as f:
             self.i2a = [l.strip().split()[:2] for l in f.readlines()]
             self.i2a = {int(i):a for i,a in self.i2a}
     
